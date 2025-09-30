@@ -261,6 +261,21 @@ app.get('/availability', async (req, res) => {
         await autoDismissConsent(page).catch(() => {});
         await page.evaluate(() => window.scrollTo(0, 0)).catch(()=>{});
         const hydrated = await ensureHydrated(page);
+
+// Club name from title (cleaned)
+{
+  const rawTitle = await page.title().catch(() => '');
+  clubDebug.clubTitleRaw = rawTitle;
+  clubDebug.clubName = (rawTitle || '')
+    .replace(/^Book a court\s+(?:at|in)\s+/i, '')
+    .replace(/\s*\|\s*Playtomic\s*$/i, '')
+    .trim();
+}
+
+
+
+         
+         
         clubDebug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
         // Drive picker to date
@@ -291,10 +306,49 @@ for (const payload of availPayloads) {
 
 // Stop listening for more responses for this club
 page.off('response', onAvail);
+         // Fallback: if no prices captured, try fetching the same availability JSON once
+if (priceIndex.size === 0) {
+  try {
+    const fetched = await page.evaluate(async (theDate) => {
+      const out = { clubId: null, payload: null };
+      try {
+        const el = document.querySelector('script#__NEXT_DATA__');
+        const data = el ? JSON.parse(el.textContent || '{}') : null;
+
+        const findUuid = (n) => {
+          if (!n || typeof n !== 'object') return null;
+          if (typeof n.id === 'string' &&
+              /^[0-9a-f-]{8}-[0-9a-f-]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(n.id)) {
+            return n.id;
+          }
+          for (const v of Object.values(n)) {
+            const got = findUuid(v);
+            if (got) return got;
+          }
+          return null;
+        };
+
+        out.clubId = findUuid(data);
+        if (out.clubId) {
+          const url = `/api/clubs/availability?clubId=${encodeURIComponent(out.clubId)}&date=${encodeURIComponent(theDate)}`;
+          const resp = await fetch(url, { credentials: 'same-origin' });
+          if (resp.ok) out.payload = await resp.json();
+        }
+      } catch {}
+      return out;
+    }, date);
+
+    if (fetched?.payload) {
+      const part = buildPriceIndex(fetched.payload);
+      for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
+    }
+  } catch {}
+}
+
 
         // Per-court meta (name/tags)
-        const meta = await collectCourtMeta(page);
-        clubDebug.clubName = meta.clubName || null;
+const meta = await collectCourtMeta(page);
+clubDebug.clubName = meta.clubName || clubDebug.clubName || null;
 
         // Visible/available blocks → source of truth
         const blocks = await page.$$eval(
