@@ -29,19 +29,11 @@ async function getBrowser() {
   BROWSER = await chromium.launch({ headless: true, args: CHROME_ARGS });
   return BROWSER;
 }
-
 async function newContext() {
   const browser = await getBrowser();
+
+  // 1) Create context (only the options object goes here)
   const context = await browser.newContext({
-       // Block images, fonts, trackers to speed things up
-  await context.route('**/*', (route) => {
-    const url = route.request().url();
-    if (/\.(png|jpe?g|gif|webp|svg|ico|bmp|woff2?|ttf)$/i.test(url)) return route.abort();
-    if (url.includes('google-analytics.com') || url.includes('googletagmanager.com') ||
-        url.includes('doubleclick.net') || url.includes('hotjar') ||
-        url.includes('facebook.net')   || url.includes('segment.com')) return route.abort();
-    route.continue();
-  });
     viewport: { width: 1366, height: 900 },
     deviceScaleFactor: 1,
     isMobile: false,
@@ -56,7 +48,17 @@ async function newContext() {
     },
   });
 
-  // Light “stealth” patches before any page script runs
+  // 2) Speed up: block images, fonts, trackers (note: this is OUTSIDE the options object)
+  await context.route('**/*', (route) => {
+    const url = route.request().url();
+    if (/\.(png|jpe?g|gif|webp|svg|ico|bmp|woff2?|ttf)$/i.test(url)) return route.abort();
+    if (url.includes('google-analytics.com') || url.includes('googletagmanager.com') ||
+        url.includes('doubleclick.net') || url.includes('hotjar') ||
+        url.includes('facebook.net')   || url.includes('segment.com')) return route.abort();
+    route.continue();
+  });
+
+  // 3) Light stealth
   await context.addInitScript(() => {
     try {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -73,8 +75,8 @@ async function newContext() {
       if (window.WebGLRenderingContext) {
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function (param) {
-          if (param === 37445) return 'Intel Inc.';                 // UNMASKED_VENDOR_WEBGL
-          if (param === 37446) return 'Intel Iris OpenGL Engine';   // UNMASKED_RENDERER_WEBGL
+          if (param === 37445) return 'Intel Inc.';               // UNMASKED_VENDOR_WEBGL
+          if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
           return getParameter.call(this, param);
         };
       }
@@ -83,6 +85,7 @@ async function newContext() {
 
   return context;
 }
+
 
 /* =========================
    Express views / demo
