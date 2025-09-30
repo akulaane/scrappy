@@ -100,6 +100,19 @@ app.post('/', async (req, res) => {
     context = await newContext();
     page = await context.newPage();
 
+   // Block images/media/fonts/analytics to speed up
+   await page.route('**/*', route => {
+   const req = route.request();
+   const t = req.resourceType();
+  const u = req.url();
+  if (t === 'image' || t === 'media' || t === 'font' || u.includes('google-analytics')) {
+    return route.abort();
+  }
+  route.continue();
+});
+
+     
+
     await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
 
     const screenshot = await page.screenshot();
@@ -214,17 +227,25 @@ app.get('/availability', async (req, res) => {
     page = await context.newPage();
 
     // Network observers
+// Commit signal for correct-date load
+let commitXHR = false;
+
+     
     page.on('response', (r) => {
-      const u = r.url();
-      if (u.includes('/_next/')) {
-        const s = r.status();
-        if (s >= 200 && s < 300) nextOk++; else nextBlocked++;
-      }
-      if (u.includes('/api/clubs/availability') && r.status() === 200) {
-        debug.sawAvail = true;
-        debug.lastAvailUrl = u;
-      }
-    });
+  const u = r.url();
+  if (u.includes('/_next/')) {
+    const s = r.status();
+    if (s >= 200 && s < 300) nextOk++; else nextBlocked++;
+  }
+  if (u.includes('/api/clubs/availability')) {
+    if (u.includes(`date=${date}`) && r.status() === 200) {
+      commitXHR = true;         // <-- ONLY a commit signal (we still read DOM for availability)
+      debug.sawAvail = true;
+      debug.lastAvailUrl = u;
+    }
+  }
+});
+
     page.on('requestfailed', (r) => {
       const u = r.url();
       if (u.includes('playtomic.com') || u.includes('/_next/')) {
@@ -258,6 +279,29 @@ app.get('/availability', async (req, res) => {
     debug.picker.xhrOk            = cal.xhrOk;
     debug.picker.pill             = cal.pill;
 
+     // Wait briefly for the “commitXHR” signal (in case cal.xhrOk missed it)
+let waited = 0;
+while (!commitXHR && waited < 5000) {
+  await page.waitForTimeout(150);
+  waited += 150;
+}
+
+// If still no commit signal, try re-selecting the day once (light retry)
+if (!commitXHR) {
+  const cal2 = await forceDateInUI(page, date);
+  debug.infos.push('reselect_day_once');
+  let waited2 = 0;
+  while (!commitXHR && waited2 < 4000) {
+    await page.waitForTimeout(150);
+    waited2 += 150;
+  }
+}
+
+// Sweep + settle to avoid partial virtualized grids
+await sweepVirtualizedGrid(page);
+await waitForGridQuiet(page, 600);
+
+
     // 3) Wait for blocks or “cannot book” banner
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
     const sawBlocks = await page.locator('div[data-court-id][data-start-hour][data-end-hour]').first().isVisible().catch(()=>false);
@@ -279,9 +323,40 @@ app.get('/availability', async (req, res) => {
     debug.blocksFound = blocks.length;
     debug.rootDivs = await page.$$eval('#__next div', (els) => els.length).catch(() => 0);
 
+     // If nothing rendered and we never saw commit for the target date, reload and retry once
+let blocksRetry = null;
+if (blocks.length === 0 && !commitXHR) {
+  debug.infos.push('retry_after_reload');
+  await page.reload({ waitUntil: 'domcontentloaded' }).catch(()=>{});
+  await autoDismissConsent(page).catch(()=>{});
+  await page.evaluate(() => window.scrollTo(0,0)).catch(()=>{});
+  const cal3 = await forceDateInUI(page, date);
+  let waited3 = 0;
+  while (!commitXHR && waited3 < 4000) {
+    await page.waitForTimeout(150);
+    waited3 += 150;
+  }
+  await sweepVirtualizedGrid(page);
+  await waitForGridQuiet(page, 600);
+  blocksRetry = await page.$$eval(
+    'div[data-court-id][data-start-hour][data-end-hour]',
+    (els) => els.map((el) => ({
+      courtId: el.getAttribute('data-court-id'),
+      start:   el.getAttribute('data-start-hour'),
+      end:     el.getAttribute('data-end-hour'),
+    }))
+  ).catch(() => []);
+  if (Array.isArray(blocksRetry) && blocksRetry.length > 0) {
+    debug.infos.push(`retry_blocks=${blocksRetry.length}`);
+  }
+}
+const finalBlocks = (blocksRetry && blocksRetry.length) ? blocksRetry : blocks;
+debug.blocksFound = finalBlocks.length;
+
+
     // 5) Normalize + optional duration filter (robust HH:mm + cross-midnight)
     const slots = [];
-    for (const b of blocks) {
+    for (const b of finalBlocks) {
       const startHH = normHHMM(b.start);
       const endHH   = normHHMM(b.end);
       if (!b.courtId || !startHH || !endHH) continue;
@@ -308,6 +383,8 @@ app.get('/availability', async (req, res) => {
       });
     }
     slots.sort((a, b) => a.startMin - b.startMin);
+     const totalslots = String(slots.length); // change to slots.length if you want a number
+
 
     // Optional screenshot + HTML snippet
     if (wantShot) {
@@ -319,7 +396,7 @@ app.get('/availability', async (req, res) => {
 
     debug.next = { ok: nextOk, blocked: nextBlocked, failed: reqFailed.slice(0, 10) };
 
-    return res.json({ date, slug, slots, debug });
+    return res.json({ date, slug, totalslots, slots, debug });
   } catch (e) {
     debug.next = { ok: nextOk, blocked: nextBlocked, failed: reqFailed.slice(0, 10) };
     return res.status(500).json({ error: 'scrape failed', detail: String(e), debug });
@@ -332,6 +409,49 @@ app.get('/availability', async (req, res) => {
 /* =========================
    Helpers
    ========================= */
+
+// Sweep the scrollable grid so lazy/virtual rows render
+async function sweepVirtualizedGrid(page) {
+  const handle = await page.evaluateHandle(() => {
+    const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+    const sc = sample?.closest('[class*="overflow"]') || document.scrollingElement || document.body;
+    return sc;
+  });
+
+  await page.evaluate(async sc => {
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    let prev = -1, stable = 0;
+    for (let i = 0; i < 12; i++) {
+      sc.scrollTop = 0;
+      await sleep(60);
+      sc.scrollTop = sc.scrollHeight;
+      await sleep(120);
+      const cnt = document.querySelectorAll('div[data-court-id][data-start-hour][data-end-hour]').length;
+      if (cnt === prev) {
+        if (++stable >= 2) break; // two stable reads
+      } else {
+        stable = 0;
+        prev = cnt;
+      }
+    }
+  }, handle).catch(() => {});
+  try { await handle.dispose(); } catch {}
+}
+
+// Wait for “quiet” mutations (grid not changing)
+async function waitForGridQuiet(page, ms = 600) {
+  await page.evaluate((quietMs) => new Promise(resolve => {
+    const root = document.getElementById('__next') || document.body;
+    let timer;
+    const obs = new MutationObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { obs.disconnect(); resolve(); }, quietMs);
+    });
+    obs.observe(root, { childList: true, subtree: true });
+    timer = setTimeout(() => { obs.disconnect(); resolve(); }, quietMs); // nothing happened
+  }), ms).catch(()=>{});
+}
+
 
 // Wait until the Next.js app looks “hydrated” (rough heuristic)
 async function ensureHydrated(page) {
