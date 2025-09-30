@@ -33,6 +33,15 @@ async function getBrowser() {
 async function newContext() {
   const browser = await getBrowser();
   const context = await browser.newContext({
+       // Block images, fonts, trackers to speed things up
+  await context.route('**/*', (route) => {
+    const url = route.request().url();
+    if (/\.(png|jpe?g|gif|webp|svg|ico|bmp|woff2?|ttf)$/i.test(url)) return route.abort();
+    if (url.includes('google-analytics.com') || url.includes('googletagmanager.com') ||
+        url.includes('doubleclick.net') || url.includes('hotjar') ||
+        url.includes('facebook.net')   || url.includes('segment.com')) return route.abort();
+    route.continue();
+  });
     viewport: { width: 1366, height: 900 },
     deviceScaleFactor: 1,
     isMobile: false,
@@ -310,15 +319,8 @@ await waitForGridQuiet(page, 600);
       debug.bannerUnbookable = !!unbook;
     }
 
-    // 4) Collect available-block divs (if present)
-    const blocks = await page.$$eval(
-      'div[data-court-id][data-start-hour][data-end-hour]',
-      (els) => els.map((el) => ({
-        courtId: el.getAttribute('data-court-id'),
-        start:   el.getAttribute('data-start-hour'),
-        end:     el.getAttribute('data-end-hour'),
-      }))
-    ).catch(() => []);
+// 4) Collect available-block divs across the whole (virtualized) list
+const blocks = await collectAllBlocks(page);
 
     debug.blocksFound = blocks.length;
     debug.rootDivs = await page.$$eval('#__next div', (els) => els.length).catch(() => 0);
@@ -591,6 +593,99 @@ async function forceDateInUI(page, ymd) {
 
   return out;
 }
+
+async function collectAllBlocks(page) {
+  // 1) Nudge the list to the very top first
+  await page.evaluate(() => {
+    const first = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+    if (!first) return;
+    const getScrollableParent = (el) => {
+      let p = el.parentElement;
+      while (p) {
+        const cs = getComputedStyle(p);
+        if (/(auto|scroll)/.test(cs.overflowY)) return p;
+        p = p.parentElement;
+      }
+      return null;
+    };
+    const sc = getScrollableParent(first);
+    if (sc) sc.scrollTop = 0;
+    window.scrollTo(0, 0);
+  }).catch(() => {});
+
+  // 2) Sweep downward, deduping as we go
+  const seen = new Set();
+  const key = (b) => [b.courtId, b.start, b.end].join('|');
+
+  let stuckCount = 0;
+  let lastPos = -1;
+
+  for (let i = 0; i < 60; i++) {
+    // collect what's currently rendered
+    const chunk = await page.$$eval(
+      'div[data-court-id][data-start-hour][data-end-hour]',
+      (els) => els.map((el) => ({
+        courtId: el.getAttribute('data-court-id'),
+        start:   el.getAttribute('data-start-hour'),
+        end:     el.getAttribute('data-end-hour'),
+      }))
+    ).catch(() => []);
+
+    for (const b of chunk) {
+      if (b && b.courtId && b.start && b.end) seen.add(key(b));
+    }
+
+    // scroll one screen down in the correct container (or window fallback)
+    const pos = await page.evaluate(() => {
+      const first = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+      const getScrollableParent = (el) => {
+        let p = el && el.parentElement;
+        while (p) {
+          const cs = getComputedStyle(p);
+          if (/(auto|scroll)/.test(cs.overflowY)) return p;
+          p = p.parentElement;
+        }
+        return null;
+      };
+      const sc = first && getScrollableParent(first);
+      const delta = Math.floor((sc ? sc.clientHeight : window.innerHeight) * 0.9);
+
+      let before, after, max;
+      if (sc) {
+        before = sc.scrollTop;
+        sc.scrollTop = Math.min(sc.scrollHeight, sc.scrollTop + delta);
+        after = sc.scrollTop;
+        max = sc.scrollHeight - sc.clientHeight - 1; // -1 for float fuzz
+      } else {
+        before = window.scrollY;
+        window.scrollTo(0, window.scrollY + delta);
+        after = window.scrollY;
+        max = document.documentElement.scrollHeight - window.innerHeight - 1;
+      }
+      return { before, after, max };
+    }).catch(() => ({ before: 0, after: 0, max: 0 }));
+
+    await page.waitForTimeout(120);
+
+    // stop if we can't move any further
+    if (pos.after === pos.before || pos.after >= pos.max) {
+      stuckCount++;
+      if (stuckCount >= 2) break; // reached (or very near) the end twice
+    } else {
+      stuckCount = 0;
+    }
+
+    // also stop if position doesn't change at all across iterations (belt & suspenders)
+    if (pos.after === lastPos) break;
+    lastPos = pos.after;
+  }
+
+  return Array.from(seen).map((k) => {
+    const [courtId, start, end] = k.split('|');
+    return { courtId, start, end };
+  });
+}
+
 
 /* =========================
    Start server
