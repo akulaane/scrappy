@@ -305,6 +305,7 @@ page.on('response', onAvail);
 // short settle window for the picker to fire XHRs
 await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
 page.off('response', onAvail);
+         clubDebug.priceIndexSize = priceIndex.size || 0;
 
 // (2) Look at Performance entries to discover the exact URL the app used
 try {
@@ -419,26 +420,33 @@ clubDebug.clubName = meta.clubName || clubDebug.clubName || null;
           if (earliestMin != null && st < earliestMin) continue;
           if (latestMin   != null && st > latestMin)   continue;
 
-          // price lookup
-          let price = null;
-          const k1 = `${b.courtId}|${startHH}|${endHH}`;
-          const k2 = `${b.courtId}|${startHH}|`;
-          price = priceIndex.get(k1) || priceIndex.get(k2) || null;
+// price lookup (+ fallback for DOM-only slots)
+const k1 = `${b.courtId}|${startHH}|${endHH}`;
+const k2 = `${b.courtId}|${startHH}|`;
+const lookedUp = priceIndex.get(k1) || priceIndex.get(k2) || null;
 
-          const cm = meta.courts[b.courtId] || {};
+const price       = lookedUp ?? null;
+const priceSource = lookedUp ? 'availability' : 'dom_only';
 
-          perClubItems.push({
-            slug,
-            clubName: clubDebug.clubName || meta.clubName || slug,
-            resourceId: b.courtId,
-            slotDate: date,
-            courtName: cm.courtName || null,
-            startTime: startHH,
-            endTime: endHH,
-            price: price,
-            size: cm.size || null,
-            location: cm.location || null,
-          });
+const cm = meta.courts[b.courtId] || {};
+
+perClubItems.push({
+  slug,
+  clubName: meta.clubName || slug,
+  resourceId: b.courtId,
+  slotDate: date,
+  courtName: cm.courtName || null,
+  startTime: startHH,
+  endTime: endHH,
+  price: lookedUp || '? EUR',   // show “? EUR” when no JSON price
+  priceRaw: lookedUp || null,   // keep raw for debugging/optional display
+  priceSource,                  // 'availability' or 'dom_only'
+  hasPrice: !!lookedUp,         // quick boolean for UI
+  size: cm.size || null,
+  location: cm.location || null,
+});
+
+
         }
 
         clubDebug.filtered = perClubItems.length;
