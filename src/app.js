@@ -300,7 +300,7 @@ await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
 // Build a price index from everything we saw
 let priceIndex = new Map();
 for (const payload of availPayloads) {
-  const part = buildPriceIndex(payload);
+  const part = buildPriceIndex(payload, date);
   for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
 }
 
@@ -347,7 +347,7 @@ try {
   }, date);
 
   if (fetched?.payload) {
-    const part = buildPriceIndex(fetched.payload);
+    const part = buildPriceIndex(fetched.payload, date);
     for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
   }
 } catch {}
@@ -721,127 +721,69 @@ async function collectCourtMeta(page) {
 }
 
 
-
-
-function buildPriceIndex(payload) {
-  // Returns Map key => priceString
-  // key shapes we’ll fill:
-  //   `${resourceId}|${HH:MM}|${HH:MM}`  (exact start+end)
-  //   `${resourceId}|${HH:MM}|`          (fallback by start time only)
+function buildPriceIndex(payload, targetDate) {
+  // Returns Map with keys:
+  //   `${resourceId}|HH:MM|HH:MM` (exact start+end)
+  //   `${resourceId}|HH:MM|`      (fallback by start time only)
+  //
+  // Accepts Playtomic availability array like:
+  // [
+  //   { resource_id: 'uuid', start_date: 'YYYY-MM-DD', slots: [
+  //       { start_time: '21:00:00', duration: 60, price: '28 EUR' }, ...
+  //   ]},
+  //   ...
+  // ]
   const map = new Map();
 
-  const symbolFrom = (code) => {
-    const c = String(code || '').toUpperCase();
-    if (c === 'EUR' || c === 'EURO') return '€';
-    if (c === 'GBP') return '£';
-    if (c === 'USD') return '$';
-    if (c === 'SEK' || c === 'NOK' || c === 'DKK') return 'kr';
-    return '';
+  const toHHMM = (s) => {
+    const m = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(String(s || ''));
+    if (!m) return null;
+    const H = String(parseInt(m[1], 10)).padStart(2, '0');
+    const M = m[2];
+    return `${H}:${M}`;
   };
 
-  const asHHMM = (val) => {
-    const s = String(val || '');
-    // direct "HH:MM"
-    const m = s.match(/^(\d{1,2}):(\d{2})$/);
-    if (m) {
-      const H = String(parseInt(m[1], 10)).padStart(2, '0');
-      const M = String(parseInt(m[2], 10)).padStart(2, '0');
-      return `${H}:${M}`;
-    }
-    // ISO-ish datetime → to local HH:MM
-    const d = new Date(s);
-    if (!Number.isNaN(d.getTime())) {
-      const H = String(d.getHours()).padStart(2, '0');
-      const M = String(d.getMinutes()).padStart(2, '0');
-      return `${H}:${M}`;
-    }
-    return null;
+  const addMinutes = (hhmm, minutes) => {
+    const [H, M] = hhmm.split(':').map(Number);
+    let t = (H * 60 + M + (minutes | 0)) % 1440;
+    if (t < 0) t += 1440;
+    const HH = String(Math.floor(t / 60)).padStart(2, '0');
+    const MM = String(t % 60).padStart(2, '0');
+    return `${HH}:${MM}`;
   };
 
-  const moneyString = (node, carry = {}) => {
-    if (!node || typeof node !== 'object') return null;
+  const arr = Array.isArray(payload) ? payload : payload ? [payload] : [];
 
-    // prefer formatted-like fields
-    const formatted = node.formatted || node.display || node.text;
-    if (formatted && /[0-9]/.test(String(formatted))) return String(formatted).trim();
+  // If the server returned multiple dates, prefer the target date;
+  // if the target isn't present, fall back to "any date".
+  const hasTarget = !!targetDate && arr.some(sec => String(sec.start_date || '') === String(targetDate));
 
-    // scalar amounts
-     // common nested shapes
-if (node.price && typeof node.price === 'object') {
-  const s = moneyString(node.price, carry);
-  if (s) return s;
-}
-if (node.amount && typeof node.amount === 'object') {
-  const s = moneyString(node.amount, carry);
-  if (s) return s;
-}
+  for (const sec of arr) {
+    const rid = sec.resource_id || sec.resourceId || sec.court_id || sec.courtId;
+    if (!rid) continue;
 
-    const raw =
-      node.total ?? node.amount ?? node.value ?? node.price ??
-      (typeof node === 'number' ? node : null);
-
-    if (raw != null && isFinite(Number(raw))) {
-      const cents = Number(raw);
-      const major = cents >= 1000 ? cents / 100 : cents; // heuristic
-      const sym = node.currencySymbol || carry.currencySymbol || symbolFrom(node.currency || carry.currency);
-      return `${major.toFixed(2)} ${sym}`.trim();
+    if (targetDate && hasTarget) {
+      if (String(sec.start_date || '') !== String(targetDate)) continue;
     }
 
-    // nested common price containers
-    for (const k of ['total', 'subtotal', 'final', 'fare', 'priceWithTax', 'price_without_discount']) {
-      if (node[k] && typeof node[k] === 'object') {
-        const s = moneyString(node[k], carry);
-        if (s) return s;
-      }
+    const slots = Array.isArray(sec.slots) ? sec.slots : [];
+    for (const sl of slots) {
+      const startHH = toHHMM(sl.start_time || sl.start || sl.startTime);
+      const dur     = parseInt(sl.duration || sl.minutes || 0, 10) || 0;
+      const price   = sl.price || sl.price_text || sl.priceText || null;
+      if (!startHH || !dur || !price) continue;
+
+      const endHH = addMinutes(startHH, dur);
+
+      // exact match by start+end, plus a start-only fallback
+      map.set(`${rid}|${startHH}|${endHH}`, String(price));
+      map.set(`${rid}|${startHH}|`,         String(price));
     }
-    return null;
-  };
+  }
 
-  const collect = (node, ctx = {}) => {
-    if (Array.isArray(node)) {
-      for (const it of node) collect(it, ctx);
-      return;
-    }
-    if (!node || typeof node !== 'object') return;
-
-    const next = { ...ctx };
-
-    // carry currency info when seen
-    next.currency = node.currency || node.currencyCode || next.currency || null;
-    next.currencySymbol = node.currencySymbol || node.currency_symbol || next.currencySymbol || null;
-
-    // potential resource id
-    const rid =
-      node.resourceId || node.resource_id ||
-      (node.resource && (node.resource.id || node.resource.uuid)) ||
-      node.courtId || node.court_id || next.rid || null;
-    if (rid) next.rid = rid;
-
-    // potential times
-    const start = node.start || node.startTime || node.from || node.startsAt || node.time || null;
-    const end   = node.end   || node.endTime   || node.to   || node.endsAt   || null;
-
-    // candidate price on this node
-    const priceStr = moneyString(node, next);
-
-    if (next.rid && start) {
-      const sh = asHHMM(start);
-      const eh = end ? asHHMM(end) : null;
-      if (sh) {
-        if (priceStr) {
-          if (eh) map.set(`${next.rid}|${sh}|${eh}`, priceStr);
-          map.set(`${next.rid}|${sh}|`, priceStr); // fallback by start only
-        }
-      }
-    }
-
-    // recurse
-    for (const v of Object.values(node)) collect(v, next);
-  };
-
-  collect(payload, {});
   return map;
 }
+
 
 
 
