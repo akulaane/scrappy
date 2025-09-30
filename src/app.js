@@ -306,44 +306,55 @@ for (const payload of availPayloads) {
 
 // Stop listening for more responses for this club
 page.off('response', onAvail);
-         // Fallback: if no prices captured, try fetching the same availability JSON once
-if (priceIndex.size === 0) {
-  try {
-    const fetched = await page.evaluate(async (theDate) => {
-      const out = { clubId: null, payload: null };
-      try {
-        const el = document.querySelector('script#__NEXT_DATA__');
-        const data = el ? JSON.parse(el.textContent || '{}') : null;
 
-        const findUuid = (n) => {
-          if (!n || typeof n !== 'object') return null;
-          if (typeof n.id === 'string' &&
-              /^[0-9a-f-]{8}-[0-9a-f-]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(n.id)) {
-            return n.id;
-          }
-          for (const v of Object.values(n)) {
-            const got = findUuid(v);
-            if (got) return got;
-          }
-          return null;
-        };
+// Always fetch the availability JSON once (keeps cookies/headers), then merge
+try {
+  const fetched = await page.evaluate(async (theDate) => {
+    const out = { clubId: null, payload: null };
+    try {
+      const el = document.querySelector('script#__NEXT_DATA__');
+      const data = el ? JSON.parse(el.textContent || '{}') : null;
 
-        out.clubId = findUuid(data);
-        if (out.clubId) {
-          const url = `/api/clubs/availability?clubId=${encodeURIComponent(out.clubId)}&date=${encodeURIComponent(theDate)}`;
-          const resp = await fetch(url, { credentials: 'same-origin' });
-          if (resp.ok) out.payload = await resp.json();
+      // Prefer a club object if present, fallback to first UUID
+      const pickClubId = (root) => {
+        const pp = root?.props?.pageProps;
+        if (pp?.club && (pp.club.id || pp.club.uuid)) return pp.club.id || pp.club.uuid;
+        if (pp?.clubId) return pp.clubId;
+        // generic deep UUID finder
+        const isUuid = (s) => typeof s === 'string' &&
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+        const stack = [root];
+        while (stack.length) {
+          const n = stack.pop();
+          if (n && typeof n === 'object') {
+            for (const v of Object.values(n)) {
+              if (isUuid(v)) return v;
+              if (v && typeof v === 'object') stack.push(v);
+            }
+          }
         }
-      } catch {}
-      return out;
-    }, date);
+        return null;
+      };
 
-    if (fetched?.payload) {
-      const part = buildPriceIndex(fetched.payload);
-      for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
-    }
-  } catch {}
-}
+      out.clubId = pickClubId(data);
+      if (out.clubId) {
+        const url = `/api/clubs/availability?clubId=${encodeURIComponent(out.clubId)}&date=${encodeURIComponent(theDate)}`;
+        const resp = await fetch(url, { credentials: 'same-origin' });
+        if (resp.ok) out.payload = await resp.json();
+      }
+    } catch {}
+    return out;
+  }, date);
+
+  if (fetched?.payload) {
+    const part = buildPriceIndex(fetched.payload);
+    for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
+  }
+} catch {}
+
+// Debug signal to see if we have any prices
+clubDebug.priceIndex = { size: priceIndex.size, sample: Array.from(priceIndex.keys()).slice(0, 5) };
+
 
 
         // Per-court meta (name/tags)
@@ -387,7 +398,7 @@ clubDebug.clubName = meta.clubName || clubDebug.clubName || null;
 
           perClubItems.push({
             slug,
-            clubName: meta.clubName || slug,
+            clubName: clubDebug.clubName || meta.clubName || slug,
             resourceId: b.courtId,
             slotDate: date,
             courtName: cm.courtName || null,
@@ -673,10 +684,14 @@ async function forceDateInUI(page, ymd) {
 }
 
 // Collect club name and per-court metadata (name + tags) from the current page
+// Collect club name and per-court metadata (name + tags) from the current page
 async function collectCourtMeta(page) {
-  // Club name from <title>, minus the marketing prefix
+  // Club name from <title>, clean marketing bits
   const rawTitle = await page.title().catch(() => '') || '';
-  const clubName = rawTitle.replace(/^Book a court at\s+/i, '').trim() || null;
+  const clubName = (rawTitle || '')
+    .replace(/^Book a court\s+(?:at|in)\s+/i, '')   // handle "at" or "in"
+    .replace(/\s*\|\s*Playtomic\s*$/i, '')          // drop " | Playtomic"
+    .trim() || null;
 
   // Build a per-resource meta index by walking each “row”
   const courts = await page.$$eval('div.flex.border-b.ui-stroke-neutral-default', rows => {
@@ -688,18 +703,15 @@ async function collectCourtMeta(page) {
       const rid = block?.getAttribute('data-court-id') || null;
 
       // tags are shown in that hover tooltip (they’re in the DOM even if hidden)
-      const tagsText = (row.querySelector('.group .text-sm:last-child')?.textContent || '').toLowerCase();
+      const tooltip = row.querySelector('.group .text-sm:last-child');
+      const tagsText = (tooltip?.textContent || '').toLowerCase();
       const tags = tagsText.split(',').map(s => s.trim()).filter(Boolean);
 
       const size = tags.find(t => t.includes('single') || t.includes('double')) || null;      // e.g. "double"
       const location = tags.find(t => t.includes('indoor') || t.includes('outdoor')) || null; // e.g. "indoor"
 
       if (rid) {
-        out[rid] = {
-          courtName: name,
-          size,
-          location
-        };
+        out[rid] = { courtName: name, size, location };
       }
     }
     return out;
@@ -707,6 +719,9 @@ async function collectCourtMeta(page) {
 
   return { clubName, courts };
 }
+
+
+
 
 function buildPriceIndex(payload) {
   // Returns Map key => priceString
@@ -751,6 +766,16 @@ function buildPriceIndex(payload) {
     if (formatted && /[0-9]/.test(String(formatted))) return String(formatted).trim();
 
     // scalar amounts
+     // common nested shapes
+if (node.price && typeof node.price === 'object') {
+  const s = moneyString(node.price, carry);
+  if (s) return s;
+}
+if (node.amount && typeof node.amount === 'object') {
+  const s = moneyString(node.amount, carry);
+  if (s) return s;
+}
+
     const raw =
       node.total ?? node.amount ?? node.value ?? node.price ??
       (typeof node === 'number' ? node : null);
@@ -917,6 +942,6 @@ async function collectAllBlocks(page) {
    Start server
    ========================= */
 app.listen(PORT, () => {
-  console.log(new Date().toLocaleString('en-GB', { timeZone: TZ })` - Server running on :${PORT}`);
+  console.log(`Server running on :${PORT}`);
    
 });
