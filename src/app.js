@@ -666,9 +666,7 @@ function buildPriceIndex(payload) {
     if (c === 'EUR' || c === 'EURO') return '€';
     if (c === 'GBP') return '£';
     if (c === 'USD') return '$';
-    if (c === 'SEK') return 'kr';
-    if (c === 'NOK') return 'kr';
-    if (c === 'DKK') return 'kr';
+    if (c === 'SEK' || c === 'NOK' || c === 'DKK') return 'kr';
     return '';
   };
 
@@ -677,53 +675,49 @@ function buildPriceIndex(payload) {
     // direct "HH:MM"
     const m = s.match(/^(\d{1,2}):(\d{2})$/);
     if (m) {
-      const H = String(parseInt(m[1], 10)).padStart(2,'0');
-      const M = String(parseInt(m[2], 10)).padStart(2,'0');
+      const H = String(parseInt(m[1], 10)).padStart(2, '0');
+      const M = String(parseInt(m[2], 10)).padStart(2, '0');
       return `${H}:${M}`;
     }
     // ISO-ish datetime → to local HH:MM
     const d = new Date(s);
-    if (!isNaN(d.getTime())) {
-      const H = String(d.getHours()).padStart(2,'0');
-      const M = String(d.getMinutes()).padStart(2,'0');
+    if (!Number.isNaN(d.getTime())) {
+      const H = String(d.getHours()).padStart(2, '0');
+      const M = String(d.getMinutes()).padStart(2, '0');
       return `${H}:${M}`;
     }
     return null;
   };
 
   const moneyString = (node, carry = {}) => {
-    // Accept common price shapes; prefer formatted if present
     if (!node || typeof node !== 'object') return null;
 
-    // 1) common formatted fields
+    // prefer formatted-like fields
     const formatted = node.formatted || node.display || node.text;
-    if (formatted && /[\d]/.test(String(formatted))) return String(formatted).trim();
+    if (formatted && /[0-9]/.test(String(formatted))) return String(formatted).trim();
 
-    // 2) scalar amount in minor units (e.g., 5600 = 56.00)
+    // scalar amounts
     const raw =
       node.total ?? node.amount ?? node.value ?? node.price ??
       (typeof node === 'number' ? node : null);
 
     if (raw != null && isFinite(Number(raw))) {
       const cents = Number(raw);
-      // Heuristic: if >= 1000, assume cents; else if < 1000 and has decimals, assume already in major units
-      const major = cents >= 1000 ? (cents / 100) : cents;
+      const major = cents >= 1000 ? cents / 100 : cents; // heuristic
       const sym = node.currencySymbol || carry.currencySymbol || symbolFrom(node.currency || carry.currency);
       return `${major.toFixed(2)} ${sym}`.trim();
     }
 
-    // 3) nested price object like { total: { amount, currency }, currencySymbol }
+    // nested common price containers
     for (const k of ['total', 'subtotal', 'final', 'fare', 'priceWithTax', 'price_without_discount']) {
       if (node[k] && typeof node[k] === 'object') {
         const s = moneyString(node[k], carry);
         if (s) return s;
       }
     }
-
     return null;
   };
 
-  // Crawl payload recursively and collect tuples (rid, start, end, priceString)
   const collect = (node, ctx = {}) => {
     if (Array.isArray(node)) {
       for (const it of node) collect(it, ctx);
@@ -744,11 +738,11 @@ function buildPriceIndex(payload) {
       node.courtId || node.court_id || next.rid || null;
     if (rid) next.rid = rid;
 
-    // potential start / end time fields
+    // potential times
     const start = node.start || node.startTime || node.from || node.startsAt || node.time || null;
     const end   = node.end   || node.endTime   || node.to   || node.endsAt   || null;
 
-    // price candidate on this node
+    // candidate price on this node
     const priceStr = moneyString(node, next);
 
     if (next.rid && start) {
@@ -762,7 +756,7 @@ function buildPriceIndex(payload) {
       }
     }
 
-    // continue recursion
+    // recurse
     for (const v of Object.values(node)) collect(v, next);
   };
 
@@ -770,57 +764,6 @@ function buildPriceIndex(payload) {
   return map;
 }
 
-
-  const addMaybe = (obj) => {
-    const rid =
-      obj.resourceId || obj.resource_id ||
-      (obj.resource && (obj.resource.id || obj.resourceId)) ||
-      obj.courtId || obj.court_id;
-
-    const st = obj.start || obj.from || obj.startTime || obj.start_time || obj.timeStart || obj.time_start;
-    const en = obj.end   || obj.to   || obj.endTime   || obj.end_time   || obj.timeEnd   || obj.time_end;
-
-    let priceText = null;
-    const price = obj.price || obj.finalPrice || obj.totalPrice || obj.priceTotal || obj.cost;
-    if (price) {
-      if (typeof price === 'string') {
-        priceText = price;
-      } else if (typeof price === 'object') {
-        const amount =
-          (typeof price.cents === 'number' ? price.cents / 100 : undefined) ??
-          price.amount ?? price.value ?? price.total ?? price.final;
-        const cur = price.currencySymbol || price.currency || price.currencyCode || '';
-        if (amount != null) {
-          priceText = (typeof amount === 'number' ? amount.toFixed(cur ? 2 : 0) : String(amount)) + (cur ? ` ${cur}` : '');
-        }
-      }
-    }
-    if (!priceText && (obj.amount != null || obj.cents != null)) {
-      const amount2 = (typeof obj.cents === 'number') ? obj.cents / 100 : obj.amount;
-      const cur2 = obj.currency || obj.currencySymbol || obj.currencyCode || '';
-      priceText = (typeof amount2 === 'number' ? amount2.toFixed(cur2 ? 2 : 0) : String(amount2)) + (cur2 ? ` ${cur2}` : '');
-    }
-
-    const sh = hhmm(st);
-    const eh = hhmm(en);
-    if (rid && sh && priceText) {
-      const key = `${rid}|${sh}|${eh || ''}`;
-      if (!map.has(key)) map.set(key, priceText);
-    }
-  };
-
-  const walk = (node) => {
-    if (!node) return;
-    if (Array.isArray(node)) return node.forEach(walk);
-    if (typeof node === 'object') {
-      addMaybe(node);
-      for (const v of Object.values(node)) walk(v);
-    }
-  };
-
-  try { walk(availJson); } catch {}
-  return map;
-}
 
 
 async function collectAllBlocks(page) {
