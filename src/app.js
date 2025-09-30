@@ -270,16 +270,27 @@ app.get('/availability', async (req, res) => {
         // Give layout a moment
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
 
-        // Grab availability JSON (for prices) — best-effort
-        let priceIndex = new Map();
-        const resp = await page.waitForResponse(
-          r => r.url().includes('/api/clubs/availability') && r.status() === 200 && r.request().method() === 'GET',
-          { timeout: 1500 }
-        ).catch(() => null);
-        if (resp) {
-          const data = await resp.json().catch(() => null);
-          if (data) priceIndex = buildPriceIndex(data);
-        }
+       // Capture ALL availability JSON (multiple responses happen), then merge
+const availPayloads = [];
+const onAvail = async (r) => {
+  if (r.url().includes('/api/clubs/availability') && r.status() === 200) {
+    try { availPayloads.push(await r.json()); } catch {}
+  }
+};
+page.on('response', onAvail);
+
+// Let UI settle to allow XHR(s) to fire for the selected date
+await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+
+// Build a price index from everything we saw
+let priceIndex = new Map();
+for (const payload of availPayloads) {
+  const part = buildPriceIndex(payload);
+  for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
+}
+
+// Stop listening for more responses for this club
+page.off('response', onAvail);
 
         // Per-court meta (name/tags)
         const meta = await collectCourtMeta(page);
@@ -609,62 +620,156 @@ async function forceDateInUI(page, ymd) {
 
 // Collect club name and per-court metadata (name + tags) from the current page
 async function collectCourtMeta(page) {
-  return await page.evaluate(() => {
-    const out = { clubName: null, courts: {} };
+  // Club name from <title>, minus the marketing prefix
+  const rawTitle = await page.title().catch(() => '') || '';
+  const clubName = rawTitle.replace(/^Book a court at\s+/i, '').trim() || null;
 
-    // Club name: try header, fall back to <title>
-    const h1 = document.querySelector('h1');
-    const t  = (h1 && h1.textContent || '').trim();
-    out.clubName = t || (document.title.split('|')[0] || '').trim() || null;
+  // Build a per-resource meta index by walking each “row”
+  const courts = await page.$$eval('div.flex.border-b.ui-stroke-neutral-default', rows => {
+    const out = {};
+    for (const row of rows) {
+      const name = (row.querySelector('.truncate')?.textContent || '').trim() || null;
+      // grab the *first* block in the row to read its resource id
+      const block = row.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+      const rid = block?.getAttribute('data-court-id') || null;
 
-    // For each unique data-court-id, find its row's name + tags
-    const seen = new Set();
-    const blocks = Array.from(document.querySelectorAll('[data-court-id]'));
+      // tags are shown in that hover tooltip (they’re in the DOM even if hidden)
+      const tagsText = (row.querySelector('.group .text-sm:last-child')?.textContent || '').toLowerCase();
+      const tags = tagsText.split(',').map(s => s.trim()).filter(Boolean);
 
-    for (const el of blocks) {
-      const id = el.getAttribute('data-court-id');
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
+      const size = tags.find(t => t.includes('single') || t.includes('double')) || null;      // e.g. "double"
+      const location = tags.find(t => t.includes('indoor') || t.includes('outdoor')) || null; // e.g. "indoor"
 
-      const row = el.closest('div.flex');
-      let courtName = null, tagsRaw = null;
-
-      if (row) {
-        const group = row.querySelector('.group');
-        if (group) {
-          const nameEl = group.querySelector('.truncate');
-          courtName = (nameEl && nameEl.textContent || '').trim() || null;
-
-          const tagEl = group.querySelector('.mt-1.text-sm');
-          tagsRaw = (tagEl && tagEl.textContent || '').trim() || null;
-        }
+      if (rid) {
+        out[rid] = {
+          courtName: name,
+          size,
+          location
+        };
       }
-
-      // Parse tags → size/location
-      let size = null, location = null;
-      if (tagsRaw) {
-        const low = tagsRaw.toLowerCase();
-        if (low.includes('single')) size = 'single';
-        else if (low.includes('double')) size = 'double';
-        if (low.includes('indoor')) location = 'indoor';
-        else if (low.includes('outdoor')) location = 'outdoor';
-      }
-
-      out.courts[id] = { courtName, tagsRaw, size, location };
     }
-
     return out;
-  });
+  }).catch(() => ({}));
+
+  return { clubName, courts };
 }
 
-function buildPriceIndex(availJson) {
+function buildPriceIndex(payload) {
+  // Returns Map key => priceString
+  // key shapes we’ll fill:
+  //   `${resourceId}|${HH:MM}|${HH:MM}`  (exact start+end)
+  //   `${resourceId}|${HH:MM}|`          (fallback by start time only)
   const map = new Map();
 
-  const hhmm = (val) => {
-    if (!val) return null;
-    const m = String(val).match(/(\d{1,2}):(\d{2})/);
-    return m ? `${m[1].padStart(2, '0')}:${m[2]}` : null;
+  const symbolFrom = (code) => {
+    const c = String(code || '').toUpperCase();
+    if (c === 'EUR' || c === 'EURO') return '€';
+    if (c === 'GBP') return '£';
+    if (c === 'USD') return '$';
+    if (c === 'SEK') return 'kr';
+    if (c === 'NOK') return 'kr';
+    if (c === 'DKK') return 'kr';
+    return '';
   };
+
+  const asHHMM = (val) => {
+    const s = String(val || '');
+    // direct "HH:MM"
+    const m = s.match(/^(\d{1,2}):(\d{2})$/);
+    if (m) {
+      const H = String(parseInt(m[1], 10)).padStart(2,'0');
+      const M = String(parseInt(m[2], 10)).padStart(2,'0');
+      return `${H}:${M}`;
+    }
+    // ISO-ish datetime → to local HH:MM
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) {
+      const H = String(d.getHours()).padStart(2,'0');
+      const M = String(d.getMinutes()).padStart(2,'0');
+      return `${H}:${M}`;
+    }
+    return null;
+  };
+
+  const moneyString = (node, carry = {}) => {
+    // Accept common price shapes; prefer formatted if present
+    if (!node || typeof node !== 'object') return null;
+
+    // 1) common formatted fields
+    const formatted = node.formatted || node.display || node.text;
+    if (formatted && /[\d]/.test(String(formatted))) return String(formatted).trim();
+
+    // 2) scalar amount in minor units (e.g., 5600 = 56.00)
+    const raw =
+      node.total ?? node.amount ?? node.value ?? node.price ??
+      (typeof node === 'number' ? node : null);
+
+    if (raw != null && isFinite(Number(raw))) {
+      const cents = Number(raw);
+      // Heuristic: if >= 1000, assume cents; else if < 1000 and has decimals, assume already in major units
+      const major = cents >= 1000 ? (cents / 100) : cents;
+      const sym = node.currencySymbol || carry.currencySymbol || symbolFrom(node.currency || carry.currency);
+      return `${major.toFixed(2)} ${sym}`.trim();
+    }
+
+    // 3) nested price object like { total: { amount, currency }, currencySymbol }
+    for (const k of ['total', 'subtotal', 'final', 'fare', 'priceWithTax', 'price_without_discount']) {
+      if (node[k] && typeof node[k] === 'object') {
+        const s = moneyString(node[k], carry);
+        if (s) return s;
+      }
+    }
+
+    return null;
+  };
+
+  // Crawl payload recursively and collect tuples (rid, start, end, priceString)
+  const collect = (node, ctx = {}) => {
+    if (Array.isArray(node)) {
+      for (const it of node) collect(it, ctx);
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+
+    const next = { ...ctx };
+
+    // carry currency info when seen
+    next.currency = node.currency || node.currencyCode || next.currency || null;
+    next.currencySymbol = node.currencySymbol || node.currency_symbol || next.currencySymbol || null;
+
+    // potential resource id
+    const rid =
+      node.resourceId || node.resource_id ||
+      (node.resource && (node.resource.id || node.resource.uuid)) ||
+      node.courtId || node.court_id || next.rid || null;
+    if (rid) next.rid = rid;
+
+    // potential start / end time fields
+    const start = node.start || node.startTime || node.from || node.startsAt || node.time || null;
+    const end   = node.end   || node.endTime   || node.to   || node.endsAt   || null;
+
+    // price candidate on this node
+    const priceStr = moneyString(node, next);
+
+    if (next.rid && start) {
+      const sh = asHHMM(start);
+      const eh = end ? asHHMM(end) : null;
+      if (sh) {
+        if (priceStr) {
+          if (eh) map.set(`${next.rid}|${sh}|${eh}`, priceStr);
+          map.set(`${next.rid}|${sh}|`, priceStr); // fallback by start only
+        }
+      }
+    }
+
+    // continue recursion
+    for (const v of Object.values(node)) collect(v, next);
+  };
+
+  collect(payload, {});
+  return map;
+}
+
 
   const addMaybe = (obj) => {
     const rid =
