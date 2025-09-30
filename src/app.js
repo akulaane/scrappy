@@ -917,5 +917,6 @@ async function collectAllBlocks(page) {
    Start server
    ========================= */
 app.listen(PORT, () => {
-  console.log(`Server running on :${PORT} (TZ=${TZ})`);
+  console.log(new Date().toLocaleString('en-GB', { timeZone: TZ })` - Server running on :${PORT}`);
+   
 });
