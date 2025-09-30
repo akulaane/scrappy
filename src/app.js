@@ -285,76 +285,107 @@ app.get('/availability', async (req, res) => {
         // Give layout a moment
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
 
-       // Capture ALL availability JSON (multiple responses happen), then merge
+// ---- PRICE CAPTURE: (1) live responses, (2) performance sniff, (3) in-page guesses ----
+let priceIndex = new Map();
 const availPayloads = [];
+
+// (1) Listen briefly for live responses to /api/clubs/availability
 const onAvail = async (r) => {
-  if (r.url().includes('/api/clubs/availability') && r.status() === 200) {
-    try { availPayloads.push(await r.json()); } catch {}
+  const u = r.url();
+  if (u.includes('/api/clubs/availability') && r.status() === 200) {
+    try {
+      const j = await r.json();
+      availPayloads.push(j);
+      (clubDebug.availUrls ||= []).push(u);
+    } catch {}
   }
 };
 page.on('response', onAvail);
 
-// Let UI settle to allow XHR(s) to fire for the selected date
+// short settle window for the picker to fire XHRs
 await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+page.off('response', onAvail);
 
-// Build a price index from everything we saw
-let priceIndex = new Map();
+// (2) Look at Performance entries to discover the exact URL the app used
+try {
+  const perfUrls = await page.evaluate(() => {
+    const entries = performance.getEntriesByType('resource') || [];
+    return entries.map(e => e.name).filter(u => u.includes('/api/clubs/availability')).slice(-3);
+  });
+  if (perfUrls?.length) {
+    clubDebug.perfAvailUrls = perfUrls;
+    // Fetch the newest one again to get JSON
+    const lastUrl = perfUrls[perfUrls.length - 1];
+    const p = await page.evaluate(async (u) => {
+      const r = await fetch(u, { credentials: 'same-origin' });
+      if (!r.ok) return null;
+      try { return await r.json(); } catch { return null; }
+    }, lastUrl);
+    if (p) availPayloads.push(p);
+  }
+} catch {}
+
+// (3) If still nothing, try a few likely query variants using clubId from __NEXT_DATA__
+if (availPayloads.length === 0) {
+  try {
+    const guessed = await page.evaluate(async (theDate) => {
+      const tried = [];
+      const results = [];
+
+      const el = document.querySelector('script#__NEXT_DATA__');
+      const data = el ? JSON.parse(el.textContent || '{}') : null;
+
+      function findUuid(n) {
+        if (!n || typeof n !== 'object') return null;
+        if (typeof n.id === 'string' && /^[0-9a-f-]{36}$/i.test(n.id)) return n.id;
+        for (const v of Object.values(n)) { const got = findUuid(v); if (got) return got; }
+        return null;
+      }
+
+      const clubId = findUuid(data);
+      if (!clubId) return { tried, results };
+
+      const urls = [
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&start_date=${encodeURIComponent(theDate)}`,
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&start_date=${encodeURIComponent(theDate)}&days=2`,
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&date=${encodeURIComponent(theDate)}`,
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&startDate=${encodeURIComponent(theDate)}`,
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&dateFrom=${encodeURIComponent(theDate)}`
+      ];
+
+      for (const u of urls) {
+        tried.push(u);
+        try {
+          const r = await fetch(u, { credentials: 'same-origin' });
+          if (r.ok) {
+            const j = await r.json();
+            if (j && (Array.isArray(j) ? j.length : Object.keys(j).length)) {
+              results.push({ url: u, payload: j });
+              break;
+            }
+          }
+        } catch {}
+      }
+      return { tried, results };
+    }, date);
+
+    clubDebug.guessTried = guessed?.tried || [];
+    if (guessed?.results?.length) {
+      clubDebug.guessHit = guessed.results[0].url;
+      availPayloads.push(guessed.results[0].payload);
+    }
+  } catch {}
+}
+
+// Finally build the index (prefer target date if present)
 for (const payload of availPayloads) {
   const part = buildPriceIndex(payload, date);
   for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
 }
-
-// Stop listening for more responses for this club
-page.off('response', onAvail);
-
-// Always fetch the availability JSON once (keeps cookies/headers), then merge
-try {
-  const fetched = await page.evaluate(async (theDate) => {
-    const out = { clubId: null, payload: null };
-    try {
-      const el = document.querySelector('script#__NEXT_DATA__');
-      const data = el ? JSON.parse(el.textContent || '{}') : null;
-
-      // Prefer a club object if present, fallback to first UUID
-      const pickClubId = (root) => {
-        const pp = root?.props?.pageProps;
-        if (pp?.club && (pp.club.id || pp.club.uuid)) return pp.club.id || pp.club.uuid;
-        if (pp?.clubId) return pp.clubId;
-        // generic deep UUID finder
-        const isUuid = (s) => typeof s === 'string' &&
-          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
-        const stack = [root];
-        while (stack.length) {
-          const n = stack.pop();
-          if (n && typeof n === 'object') {
-            for (const v of Object.values(n)) {
-              if (isUuid(v)) return v;
-              if (v && typeof v === 'object') stack.push(v);
-            }
-          }
-        }
-        return null;
-      };
-
-      out.clubId = pickClubId(data);
-      if (out.clubId) {
-        const url = `/api/clubs/availability?clubId=${encodeURIComponent(out.clubId)}&date=${encodeURIComponent(theDate)}`;
-        const resp = await fetch(url, { credentials: 'same-origin' });
-        if (resp.ok) out.payload = await resp.json();
-      }
-    } catch {}
-    return out;
-  }, date);
-
-  if (fetched?.payload) {
-    const part = buildPriceIndex(fetched.payload, date);
-    for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
-  }
-} catch {}
-
-// Debug signal to see if we have any prices
-clubDebug.priceIndex = { size: priceIndex.size, sample: Array.from(priceIndex.keys()).slice(0, 5) };
-
+clubDebug.priceIndex = {
+  size: priceIndex.size,
+  sample: Array.from(priceIndex.keys()).slice(0, 5)
+};
 
 
         // Per-court meta (name/tags)
@@ -722,14 +753,14 @@ async function collectCourtMeta(page) {
 
 
 function buildPriceIndex(payload, targetDate) {
-  // Returns Map with keys:
-  //   `${resourceId}|HH:MM|HH:MM` (exact start+end)
-  //   `${resourceId}|HH:MM|`      (fallback by start time only)
+  // Keys we produce:
+  //   `${resourceId}|HH:MM|HH:MM`  (exact start+end)
+  //   `${resourceId}|HH:MM|`       (start-only fallback)
   //
-  // Accepts Playtomic availability array like:
+  // Matches Playtomic array like:
   // [
   //   { resource_id: 'uuid', start_date: 'YYYY-MM-DD', slots: [
-  //       { start_time: '21:00:00', duration: 60, price: '28 EUR' }, ...
+  //       { start_time:'21:00:00', duration:60, price:'28 EUR' }, ...
   //   ]},
   //   ...
   // ]
@@ -739,8 +770,7 @@ function buildPriceIndex(payload, targetDate) {
     const m = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(String(s || ''));
     if (!m) return null;
     const H = String(parseInt(m[1], 10)).padStart(2, '0');
-    const M = m[2];
-    return `${H}:${M}`;
+    return `${H}:${m[2]}`;
   };
 
   const addMinutes = (hhmm, minutes) => {
@@ -753,9 +783,6 @@ function buildPriceIndex(payload, targetDate) {
   };
 
   const arr = Array.isArray(payload) ? payload : payload ? [payload] : [];
-
-  // If the server returned multiple dates, prefer the target date;
-  // if the target isn't present, fall back to "any date".
   const hasTarget = !!targetDate && arr.some(sec => String(sec.start_date || '') === String(targetDate));
 
   for (const sec of arr) {
@@ -775,9 +802,8 @@ function buildPriceIndex(payload, targetDate) {
 
       const endHH = addMinutes(startHH, dur);
 
-      // exact match by start+end, plus a start-only fallback
       map.set(`${rid}|${startHH}|${endHH}`, String(price));
-      map.set(`${rid}|${startHH}|`,         String(price));
+      map.set(`${rid}|${startHH}|`,         String(price)); // fallback by start only
     }
   }
 
