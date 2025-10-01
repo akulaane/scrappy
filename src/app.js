@@ -542,7 +542,6 @@ perClubItems.push({
 /* =========================
    Single-slot price verifier (popup anchored by time + court name)
    ========================= */
-
 app.get('/price', async (req, res) => {
   const BASE = 'https://playtomic.com';
 
@@ -553,8 +552,8 @@ app.get('/price', async (req, res) => {
   let   endHH      = normHHMM(String(req.query.end   || ''));
   let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
-  // ---- tiny helpers
-  const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
+  // small helpers (scoped to this route)
+  const hmToMin = (s) => { const [h,m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
   const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
   const minDiff = (a,b) => ((b - a + 1440) % 1440);
   const allowedDur = [60, 90, 120];
@@ -563,109 +562,22 @@ app.get('/price', async (req, res) => {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
 
-  // Prefer duration when both duration & end are present but disagree.
+  // prefer duration when both are present but disagree
   if (endHH && duration) {
     const inferred = minDiff(hmToMin(startHH), hmToMin(endHH));
-    if (Math.abs(inferred - duration) >= 5) {
-      endHH = minToHHMM(hmToMin(startHH) + duration);
-    }
+    if (Math.abs(inferred - duration) >= 5) endHH = minToHHMM(hmToMin(startHH) + duration);
   }
-  // Derive the missing one
+  // derive the missing one
   if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
   if (!duration && endHH) duration = minDiff(hmToMin(startHH), hmToMin(endHH));
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
-
-  // Snap to nearest 60/90/120 if it’s off a tad (DST, etc.)
+  // snap to 60/90/120 if slightly off
   if (!allowedDur.includes(duration)) {
     duration = allowedDur.reduce((best, v) =>
       Math.abs(v - duration) < Math.abs(best - duration) ? v : best, allowedDur[0]);
   }
-
-  // ---- robust popup anchoring
-  async function getCourtNameForResource(page, rid) {
-    try {
-      return await page.evaluate((resourceId) => {
-        const block = document.querySelector(`div[data-court-id="${resourceId}"]`);
-        if (!block) return null;
-        let row = block.closest('div.flex.border-b');
-        if (!row) return null;
-        const name = row.querySelector('.truncate')?.textContent || '';
-        return name.trim() || null;
-      }, rid);
-    } catch { return null; }
-  }
-
-  // Find the popup whose header shows the desired start time AND (if known) the same court name.
-  async function pickPopupByStartAndName(page, startHH, courtName, timeoutMs = 7000) {
-    const deadline = Date.now() + timeoutMs;
-    const norm = s => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
-
-    while (Date.now() < deadline) {
-      // Limit to “Continue” popups to avoid other overlays
-      const popups = page.locator('div:has(button:has-text("Continue"))');
-      const count = await popups.count().catch(() => 0);
-
-      for (let i = 0; i < count; i++) {
-        const p = popups.nth(i);
-        try { await p.waitFor({ state: 'visible', timeout: 200 }); } catch {}
-
-        const headerVals = await p.locator('.flex.flex-row.justify-between.font-bold div').allTextContents().catch(()=>[]);
-        const leftName   = norm(headerVals?.[0] || '');
-        const rightTime  = norm(headerVals?.[1] || '');
-
-        const timeMatch = rightTime === startHH;
-        const nameMatch = courtName ? leftName.includes(courtName) : true;
-
-        if (timeMatch && nameMatch) {
-          return { popup: p, leftName, rightTime };
-        }
-      }
-      await page.waitForTimeout(120);
-    }
-    return null;
-  }
-
-  // Extract duration rows from a specific popup node
-  async function readRowsFromPopup(popup) {
-    return await popup.evaluate((root) => {
-      const norm = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
-      const rows = [];
-      // We scan for “two DIV children, left looks like a duration, right looks like money”
-      const nodes = root.querySelectorAll('div');
-      for (const el of nodes) {
-        if (!el.children || el.children.length !== 2) continue;
-        const [a,b] = el.children;
-        if (!a || !b || a.tagName !== 'DIV' || b.tagName !== 'DIV') continue;
-
-        const left  = norm(a.textContent || '');
-        const right = norm(b.textContent || '');
-
-        const looksLikeDuration = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
-        const looksLikeMoney    = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
-
-        if (looksLikeDuration && looksLikeMoney) {
-          rows.push([left, right]);
-        }
-      }
-      return rows;
-    });
-  }
-
-  // Minutes parser for “1h 30m”, “2h”, “90m”, etc.
-  const toMinutes = (label) => {
-    const s = String(label || '').replace(/\u00a0/g, ' ').toLowerCase().trim();
-    let m;
-    if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) return (+m[1])*60 + (+m[2]);
-    if ((m = s.match(/(\d+)\s*h(?![a-z])/)))        return (+m[1])*60;
-    if ((m = s.match(/(\d{1,3})\s*m/)))             return (+m[1]);
-    return null;
-  };
-
-  // Hard overall guard so the route can’t hang forever
-  const HARD_DEADLINE_MS = 15000;
-  const hardDeadline = Date.now() + HARD_DEADLINE_MS;
 
   let context, page;
   const debug = {
@@ -684,7 +596,7 @@ app.get('/price', async (req, res) => {
     context = await newContext();
     page = await context.newPage();
 
-    // Trim trackers for speed
+    // trim trackers
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -695,79 +607,77 @@ app.get('/price', async (req, res) => {
       route.continue();
     });
 
-    // Navigate + hydrate (abort if hard timeout passes)
-    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_nav');
-    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: Math.max(1, hardDeadline - Date.now()) });
-    await page.waitForSelector('#__next', { timeout: Math.max(1, hardDeadline - Date.now()) }).catch(() => {});
+    // nav + hydrate
+    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector('#__next', { timeout: 30000 }).catch(() => {});
     await autoDismissConsent(page).catch(() => {});
     await page.evaluate(() => window.scrollTo(0, 0)).catch(()=>{});
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
-    // Date → grid
-    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_date');
+    // date → grid
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
-     await scrollGridToTop(page);
+    await scrollGridToTop(page);
 
-    // For extra anchoring: read the court name for this resource
-    debug.courtName = await getCourtNameForResource(page, resourceId);
+    // click the exact block
+    const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
+    debug.clicked = clickRes.clicked;
+    debug.courtName = clickRes.courtName || debug.courtName || null;
 
-    // Click the exact block (bounded inside helper)
-    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_click');
-   // click the slot
-const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
-debug.clicked = clickRes.clicked;
-debug.courtName = clickRes.courtName || debug.courtName || null;
+    if (!debug.clicked) {
+      debug.popupWhy = 'not_clicked';
+      return res.json({
+        slug, date, resourceId,
+        startTime: startHH,
+        endTime: endHH,
+        price: '? EUR',
+        source: 'popup',
+        debug
+      });
+    }
 
-if (!debug.clicked) {
-  debug.popupWhy = 'not_clicked';
-  return res.json({
-    slug, date, resourceId,
-    startTime: startHH,
-    endTime: endHH,
-    price: '? EUR',
-    source: 'popup',
-    debug
-  });
-}
+    // read popup (match header time + fuzzy court name)
+    const popup = await readPopupDurations(page, debug.courtName, startHH, 3500);
+    if (!popup) {
+      debug.popupWhy = 'popup_not_found_for_start_and_name';
+      debug.popupHeader = null;
+      debug.popupDurations = [];
+      debug.chosen = null;
+      return res.json({
+        slug, date, resourceId,
+        startTime: startHH,
+        endTime: endHH,
+        price: '? EUR',
+        source: 'popup',
+        debug
+      });
+    }
 
-// read popup by matching header (time + fuzzy court name)
-const popup = await readPopupDurations(page, debug.courtName, startHH, 3500);
-if (!popup) {
-  debug.popupWhy = 'popup_not_found_for_start_and_name';
-  debug.popupHeader = null;
-  debug.popupDurations = [];
-  debug.chosen = null;
-  return res.json({
-    slug, date, resourceId,
-    startTime: startHH,
-    endTime: endHH,
-    price: '? EUR',
-    source: 'popup',
-    debug
-  });
-}
+    debug.popupWhy = 'ok';
+    debug.popupHeader = { name: popup.name, time: popup.time };
+    debug.popupDurations = popup.rows;
 
-debug.popupWhy = 'ok';
-debug.popupHeader = { name: popup.name, time: popup.time };
-debug.popupDurations = popup.rows;
+    const chosen = (popup.rows || []).find(r => r.minutes === duration) || null;
+    debug.chosen = chosen;
 
-let chosen = null;
-if (popup.rows && popup.rows.length) {
-  // exact match only
-  chosen = popup.rows.find(r => r.minutes === duration) || null;
-}
-debug.chosen = chosen;
+    return res.json({
+      slug, date, resourceId,
+      startTime: startHH,
+      endTime: endHH,
+      price: chosen ? chosen.price : '? EUR',
+      source: 'popup',
+      debug
+    });
 
-return res.json({
-  slug, date, resourceId,
-  startTime: startHH,
-  endTime: endHH,
-  price: chosen ? chosen.price : '? EUR',
-  source: 'popup',
-  debug
+  } catch (e) {
+    return res.status(500).json({ error: 'price failed', detail: String(e), debug });
+  } finally {
+    try { await page?.close(); } catch {}
+    try { await context?.close(); } catch {}
+  }
 });
+
 
 
 
@@ -926,63 +836,9 @@ async function getGridScroller(page) {
   return handle;
 }
 
-// Find the clickable element for a slot (inner absolute block if present)
-async function findSlotLocator(page, resourceId, startHH, endHH) {
-  const starts = hhVariants(startHH);
-  const ends   = endHH ? hhVariants(endHH) : [null];
 
-  for (const s of starts) {
-    for (const e of ends) {
-      let base = page.locator(`div[data-court-id="${resourceId}"][data-start-hour="${s}"]`);
-      if (e) base = base.filter({ has: page.locator(`[data-end-hour="${e}"]`) });
-      if (await base.count()) {
-        // Prefer the inner absolute block if it exists (that’s what’s clickable)
-        const abs = base.locator('xpath=.//div[contains(@class,"absolute")]').first();
-        if (await abs.count()) return abs;
-        return base.first();
-      }
-    }
-  }
-  return null;
-}
 
-// Scroll the slot into view and click it; confirm modal appears
-async function clickSlotAndWaitModal(page, resourceId, startHH, endHH, timeoutMs = 5000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    const loc = await findSlotLocator(page, resourceId, startHH, endHH);
-    if (loc) {
-      try { await loc.scrollIntoViewIfNeeded(); } catch {}
-      await page.waitForTimeout(80);
-      const box = await loc.boundingBox().catch(() => null);
-      if (box) {
-        await page.mouse.click(box.x + box.width / 2, box.y + Math.min(box.height / 2, 8), { delay: 20 });
-      } else {
-        await loc.click({ force: true }).catch(()=>{});
-      }
 
-      // modal visible?
-      const modal = page.getByRole('dialog').first();
-      if (await modal.count()) return true;
-      const cont = page.getByRole('button', { name: /continue/i }).first();
-      if (await cont.count()) return true;
-    }
-
-    // Nudge virtualization by scrolling a bit
-    const sc = await getGridScroller(page);
-    await page.evaluate(sc => { sc.scrollTop += Math.floor(sc.clientHeight * 0.8); }, sc).catch(()=>{});
-    try { await sc.dispose(); } catch {}
-    await page.waitForTimeout(120);
-  }
-  return false;
-}
-
-// Duration → label the UI shows (60 -> "1h 00m", 90 -> "1h 30m")
-function formatDurationLabel(mins) {
-  const h = Math.floor((mins|0) / 60);
-  const m = (mins|0) % 60;
-  return `${h}h ${String(m).padStart(2,'0')}m`;
-}
 
 
 
@@ -994,81 +850,7 @@ function formatDurationLabel(mins) {
   return `${h}h ${String(m).padStart(2,'0')}m`;
 }
 
-// Click the duration option in the popup (bounded wait)
-async function selectDurationOption(page, minutes, timeoutMs = 3500) {
-  if (!minutes) return false;
-  const label = formatDurationLabel(minutes); // e.g. "1h 30m"
-  const start = Date.now();
 
-  // Try a few robust selectors
-  const tries = [
-    () => page.getByRole('button', { name: new RegExp(`^\\s*${label}\\s*$`, 'i') }).first(),
-    () => page.locator(`button:has-text("${label}")`).first(),
-    () => page.getByText(label, { exact: false }).first(),
-  ];
-
-  while (Date.now() - start < timeoutMs) {
-    for (const fn of tries) {
-      const opt = fn();
-      if (await opt.count()) {
-        try { await opt.scrollIntoViewIfNeeded(); } catch {}
-        await opt.click({ force: true, delay: 20 }).catch(()=>{});
-        await page.waitForTimeout(150);
-        return true;
-      }
-    }
-    await page.waitForTimeout(150);
-  }
-  return false;
-}
-
-// Read "Continue – XX EUR" from the modal (bounded)
-async function readContinuePrice(page, timeoutMs = 3500) {
-  const start = Date.now();
-  const moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
-
-  while (Date.now() - start < timeoutMs) {
-    // Primary: Continue button text
-    const btn = page.getByRole('button', { name: /continue/i }).first();
-    if (await btn.count()) {
-      const txt = (await btn.textContent()) || '';
-      const m = txt.match(moneyRe);
-      if (m) return m[0].replace(/\s+/g, ' ').trim();
-    }
-
-    // Fallback: any visible money-like text in the dialog
-    const loc = page.locator('text=/\\b\\d+(?:[.,]\\d{1,2})?\\s*(?:€|EUR)\\b/i').first();
-    if (await loc.count()) {
-      const t = (await loc.textContent()) || '';
-      const m = t.match(moneyRe);
-      if (m) return m[0].replace(/\s+/g, ' ').trim();
-    }
-
-    await page.waitForTimeout(200);
-  }
-  return null;
-}
-
-
-// Read a visible price like "56 EUR" or "56 €" within timeoutMs (no infinite waits)
-async function readPriceFromDOM(page, timeoutMs = 4500) {
-  const start = Date.now();
-  const re = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
-
-  while (Date.now() - start < timeoutMs) {
-    try {
-      // grab any node containing a money-looking token
-      const loc = page.locator('text=/\\b\\d+(?:[.,]\\d{1,2})?\\s*(?:€|EUR)\\b/i').first();
-      if (await loc.count()) {
-        const txt = (await loc.textContent()) || '';
-        const m = txt.match(re);
-        if (m) return m[0].replace(/\s+/g, ' ').trim();
-      }
-    } catch {}
-    await page.waitForTimeout(200);
-  }
-  return null;
-}
 
 
 
@@ -1151,60 +933,6 @@ async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 24
 
 
 
-
-// Try to read a price from network responses that fire after clicking.
-// Returns a string like "56 EUR" or "56 €" or null.
-async function waitForPriceFromNetwork(page, timeoutMs = 3000) {
-  let found = null;
-  const priceRe = /(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)\b/i;
-
-  const onResp = async (r) => {
-    try {
-      const ct = (r.headers()['content-type'] || '').toLowerCase();
-      // Only inspect likely JSON/text responses
-      if (!ct.includes('json') && !ct.includes('text')) return;
-      const body = ct.includes('json') ? JSON.stringify(await r.json()) : await r.text();
-      const m = priceRe.exec(body);
-      if (m && !found) found = m[0].replace(',', '.').trim();
-    } catch {}
-  };
-
-  page.on('response', onResp);
-  const start = Date.now();
-  while (!found && Date.now() - start < timeoutMs) {
-    await page.waitForTimeout(150);
-  }
-  page.off('response', onResp);
-  return found;
-}
-
-// Try to read a price string from whatever UI opened (drawer/modal/button)
-async function readPriceFromDom(page) {
-  const priceRe = /(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)\b/i;
-
-  // Search common containers first (dialogs/drawers)
-  const candidates = [
-    '[role="dialog"]',
-    '[aria-modal="true"]',
-    'aside',
-    'div[aria-labelledby*="dialog"]',
-    'div[class*="drawer"]',
-    'div[class*="modal"]',
-    'button', // buttons often contain "Book · 56 €"
-  ];
-  for (const sel of candidates) {
-    const html = await page.locator(sel).first().innerText().catch(()=> '');
-    if (html) {
-      const m = priceRe.exec(html);
-      if (m) return m[0].replace(',', '.').trim();
-    }
-  }
-
-  // Last resort: whole page (avoid if possible, but ok for single use)
-  const all = await page.locator('body').innerText().catch(()=> '');
-  const m = priceRe.exec(all || '');
-  return m ? m[0].replace(',', '.').trim() : null;
-}
 
 // Returns "56 EUR" or null. Matches by start+duration; if only endHH given, we derive duration.
 async function priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, durationMin) {
@@ -1632,6 +1360,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
