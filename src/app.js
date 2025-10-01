@@ -441,7 +441,7 @@ perClubItems.push({
   slotDate: date,
   courtName: cm.courtName || null,
   startTime: startHH,
-  endTime: endHH,
+  endTime: useEndHH,
   price: lookedUp || '? EUR',   // show “? EUR” when no JSON price
   priceRaw: lookedUp || null,   // keep raw for debugging/optional display
   priceSource,                  // 'availability' or 'dom_only'
@@ -547,19 +547,32 @@ perClubItems.push({
 //   date       = YYYY-MM-DD (required)
 //   resourceId = court/resource uuid (required)
 //   start      = "HH:MM" (required)  -> START time, local
-//   duration   = 60|90|120 (required)
+//   end        = "HH:MM" (preferred)  OR
+//   duration   = 60|90|120 (fallback if end not provided)
+
 app.get('/price', async (req, res) => {
   const BASE = 'https://playtomic.com';
 
   const slug       = String(req.query.slug || '').trim();
   const date       = String(req.query.date || '').trim();
-  const resourceId = String(req.query.resourceId || '').trim();
-  const startHH    = normHHMM(String(req.query.start || ''));
-  const duration   = parseInt(req.query.duration || '0', 10) || 0;
+const resourceId = String(req.query.resourceId || '').trim();
+const startHH    = normHHMM(String(req.query.start || ''));
+let endHH        = normHHMM(String(req.query.end || ''));
+let duration     = parseInt(req.query.duration || '0', 10) || 0;
 
-  if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH || !duration) {
-    return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start/duration' });
-  }
+if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
+  return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
+}
+
+// derive the missing one if only one of (endHH, duration) is provided
+if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
+if (!duration && endHH) duration = ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
+
+// require at least one of them to be valid
+if (!endHH && !duration) {
+  return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
+}
+
 
   let context, page;
   const debug = {
@@ -610,14 +623,17 @@ app.get('/price', async (req, res) => {
     debug.steps.push('date_selected');
 
     // Click the requested slot
-    const { clicked, endHH } = await findAndClickSlot(page, resourceId, startHH, duration);
+const { clicked, endHH: clickedEnd } = await findAndClickSlot(page, resourceId, startHH, endHH);
+const useEndHH = clickedEnd || endHH; // keep what we intended/clicked
+
     debug.clicked = clicked;
     debug.endHH = endHH;
 
     // If we failed to click, still try JSON fallback (maybe UI shape changed)
     if (!clicked) {
       debug.priceSourcesTried.push('calendar_json');
-      const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, duration);
+const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration);
+
       debug.jsonPrice = jsonPrice;
       const price = jsonPrice || null;
       return res.json({
@@ -657,7 +673,8 @@ app.get('/price', async (req, res) => {
     // If still nothing, fallback to availability JSON
     if (!finalPrice) {
       debug.priceSourcesTried.push('calendar_json');
-      const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, duration);
+const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, useEndHH, duration);
+
       debug.jsonPrice = jsonPrice;
       if (jsonPrice) {
         finalPrice = jsonPrice;
@@ -673,7 +690,7 @@ app.get('/price', async (req, res) => {
         resourceId,
         slotDate: date,
         startTime: startHH,
-        endTime: endHH,
+        endTime: useEndHH,
         price: finalPrice || '? EUR',
       },
       source,
@@ -696,34 +713,33 @@ app.get('/price', async (req, res) => {
 
 // Click the specific slot block for a resource+start+duration.
 // Returns {clicked: boolean, endHH: string|null}
-async function findAndClickSlot(page, resourceId, startHH, durationMin) {
-  const endHH = minToHHMM(hmToMin(startHH) + (durationMin|0));
-  // Make sure the row is rendered
+// Click the specific slot for a resource + start + (optional) end.
+// If endHH provided, prefer exact start+end; otherwise click any block with that start.
+async function findAndClickSlot(page, resourceId, startHH, endHH) {
   await sweepVirtualizedGrid(page).catch(()=>{});
 
-  // Prefer the exact start+end match (what the UI draws)
-  const exact = page.locator(
-    `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"][data-end-hour="${endHH}"] div.absolute`
-  ).first();
+  const exactSel = endHH
+    ? `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"][data-end-hour="${endHH}"] div.absolute`
+    : null;
 
-  // Fallback: any block with that start (if exact end not present)
-  const byStart = page.locator(
-    `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"] div.absolute`
-  ).first();
+  const byStartSel = `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"] div.absolute`;
 
-  let clicked = false;
-  if (await exact.count()) {
-    try { await exact.scrollIntoViewIfNeeded(); } catch {}
-    await exact.click({ force:true, delay: 20 }).catch(()=>{});
-    clicked = true;
-  } else if (await byStart.count()) {
-    try { await byStart.scrollIntoViewIfNeeded(); } catch {}
-    await byStart.click({ force:true, delay: 20 }).catch(()=>{});
-    clicked = true;
+  let target = null;
+  if (exactSel) {
+    const exact = page.locator(exactSel).first();
+    if (await exact.count()) target = exact;
   }
+  if (!target) {
+    const byStart = page.locator(byStartSel).first();
+    if (await byStart.count()) target = byStart;
+  }
+  if (!target) return { clicked: false, endHH: endHH || null };
 
-  return { clicked, endHH: endHH || null };
+  try { await target.scrollIntoViewIfNeeded(); } catch {}
+  await target.click({ force: true, delay: 20 }).catch(()=>{});
+  return { clicked: true, endHH: endHH || null };
 }
+
 
 // Try to read a price from network responses that fire after clicking.
 // Returns a string like "56 EUR" or "56 €" or null.
@@ -779,29 +795,24 @@ async function readPriceFromDom(page) {
   return m ? m[0].replace(',', '.').trim() : null;
 }
 
-// If clicking yields nothing, fall back to the same availability JSON we use for /availability
-// Returns "56 EUR" or null
-async function priceFromAvailabilityJSON(page, date, resourceId, startHH, durationMin) {
+// Returns "56 EUR" or null. Matches by start+duration; if only endHH given, we derive duration.
+async function priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, durationMin) {
   try {
-    const result = await page.evaluate(async ({ date, resourceId, startHH, durationMin }) => {
+    const result = await page.evaluate(async ({ date, resourceId, startHH, endHH, durationMin }) => {
       const hhmmss = (hhmm) => /\d{2}:\d{2}/.test(hhmm) ? `${hhmm}:00` : hhmm;
       const wantStart = hhmmss(startHH);
-      const wantDur = durationMin|0;
+
+      const toMin = (s) => { const [H,M]=s.split(':').map(Number); return (H|0)*60 + (M|0); };
+      const wantDur = (durationMin|0) || (endHH ? ((toMin(endHH)-toMin(startHH)+1440)%1440) : 0);
 
       const el = document.querySelector('script#__NEXT_DATA__');
       const data = el ? JSON.parse(el.textContent || '{}') : null;
 
-      // try to discover clubId somewhere in __NEXT_DATA__
       const findUuid = (n) => {
         if (!n || typeof n !== 'object') return null;
         if (typeof n.id === 'string' &&
-            /^[0-9a-f-]{8}-[0-9a-f-]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(n.id)) {
-          return n.id;
-        }
-        for (const v of Object.values(n)) {
-          const got = findUuid(v);
-          if (got) return got;
-        }
+            /^[0-9a-f-]{8}-[0-9a-f-]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(n.id)) return n.id;
+        for (const v of Object.values(n)) { const got = findUuid(v); if (got) return got; }
         return null;
       };
 
@@ -811,22 +822,22 @@ async function priceFromAvailabilityJSON(page, date, resourceId, startHH, durati
       const url = `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&date=${encodeURIComponent(date)}`;
       const resp = await fetch(url, { credentials: 'same-origin' });
       if (!resp.ok) return null;
-      const arr = await resp.json(); // array of {resource_id, start_date, slots:[{start_time,duration,price}]}
+      const arr = await resp.json();
 
       for (const row of Array.isArray(arr) ? arr : []) {
         if (String(row.resource_id) !== String(resourceId)) continue;
         for (const sl of row.slots || []) {
-          if (String(sl.start_time).startsWith(wantStart) && (sl.duration|0) === wantDur) {
-            // sl.price already like "56 EUR"
-            return String(sl.price || '').trim() || null;
-          }
+          if (!String(sl.start_time).startsWith(wantStart)) continue;
+          if (wantDur && (sl.duration|0) !== wantDur) continue;
+          return String(sl.price || '').trim() || null;
         }
       }
       return null;
-    }, { date, resourceId, startHH, durationMin });
+    }, { date, resourceId, startHH, endHH, durationMin });
     return result || null;
   } catch { return null; }
 }
+
 
 
 // Sweep the scrollable grid so lazy/virtual rows render
@@ -1210,4 +1221,5 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
