@@ -441,7 +441,7 @@ perClubItems.push({
   slotDate: date,
   courtName: cm.courtName || null,
   startTime: startHH,
-  endTime: EndHH,
+  endTime: endHH,
   price: lookedUp || '? EUR',   // show “? EUR” when no JSON price
   priceRaw: lookedUp || null,   // keep raw for debugging/optional display
   priceSource,                  // 'availability' or 'dom_only'
@@ -618,21 +618,28 @@ app.get('/price', async (req, res) => {
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = clickRes.clicked;
 
-    if (debug.clicked) {
-      // bounded wait for a visible price in modal/sidebar — no infinite loop
-      debug.domPrice = await readPriceFromDOM(page, 4500);
-      if (debug.domPrice) {
-        debug.source = 'dom';
-        return res.json({
-          slug, date, resourceId,
-          startTime: startHH,
-          endTime: endHH || minToHHMM(hmToMin(startHH) + duration),
-          price: debug.domPrice,
-          source: 'dom',
-          debug
-        });
-      }
-    }
+if (debug.clicked) {
+  // 1) pick the requested duration, if provided
+  if (duration) {
+    const picked = await selectDurationOption(page, duration, 3500);
+    debug.durationPicked = picked;
+  }
+
+  // 2) read the price from the "Continue – XX EUR" button (or fallback in modal)
+  debug.domPrice = await readContinuePrice(page, 4500);
+  if (debug.domPrice) {
+    debug.source = 'dom';
+    return res.json({
+      slug, date, resourceId,
+      startTime: startHH,
+      endTime: endHH || minToHHMM(hmToMin(startHH) + duration),
+      price: debug.domPrice,
+      source: 'dom',
+      debug
+    });
+  }
+}
+
 
     // DOM failed or slot not clickable — fall back to availability JSON (single fetch)
     debug.jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration);
@@ -665,6 +672,69 @@ app.get('/price', async (req, res) => {
 // If endHH provided, prefer exact start+end; otherwise click any block with that start.
 // Click the specific slot for (resourceId, startHH, endHH?)
 // If endHH provided, prefer exact match; otherwise click any with that start.
+
+// Turn minutes into the label Playtomic shows, e.g. 60 -> "1h 00m", 90 -> "1h 30m"
+function formatDurationLabel(mins) {
+  const h = Math.floor((mins|0) / 60);
+  const m = (mins|0) % 60;
+  return `${h}h ${String(m).padStart(2,'0')}m`;
+}
+
+// Click the duration option in the popup (bounded wait)
+async function selectDurationOption(page, minutes, timeoutMs = 3500) {
+  if (!minutes) return false;
+  const label = formatDurationLabel(minutes); // e.g. "1h 30m"
+  const start = Date.now();
+
+  // Try a few robust selectors
+  const tries = [
+    () => page.getByRole('button', { name: new RegExp(`^\\s*${label}\\s*$`, 'i') }).first(),
+    () => page.locator(`button:has-text("${label}")`).first(),
+    () => page.getByText(label, { exact: false }).first(),
+  ];
+
+  while (Date.now() - start < timeoutMs) {
+    for (const fn of tries) {
+      const opt = fn();
+      if (await opt.count()) {
+        try { await opt.scrollIntoViewIfNeeded(); } catch {}
+        await opt.click({ force: true, delay: 20 }).catch(()=>{});
+        await page.waitForTimeout(150);
+        return true;
+      }
+    }
+    await page.waitForTimeout(150);
+  }
+  return false;
+}
+
+// Read "Continue – XX EUR" from the modal (bounded)
+async function readContinuePrice(page, timeoutMs = 3500) {
+  const start = Date.now();
+  const moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
+
+  while (Date.now() - start < timeoutMs) {
+    // Primary: Continue button text
+    const btn = page.getByRole('button', { name: /continue/i }).first();
+    if (await btn.count()) {
+      const txt = (await btn.textContent()) || '';
+      const m = txt.match(moneyRe);
+      if (m) return m[0].replace(/\s+/g, ' ').trim();
+    }
+
+    // Fallback: any visible money-like text in the dialog
+    const loc = page.locator('text=/\\b\\d+(?:[.,]\\d{1,2})?\\s*(?:€|EUR)\\b/i').first();
+    if (await loc.count()) {
+      const t = (await loc.textContent()) || '';
+      const m = t.match(moneyRe);
+      if (m) return m[0].replace(/\s+/g, ' ').trim();
+    }
+
+    await page.waitForTimeout(200);
+  }
+  return null;
+}
+
 
 // Read a visible price like "56 EUR" or "56 €" within timeoutMs (no infinite waits)
 async function readPriceFromDOM(page, timeoutMs = 4500) {
@@ -1194,6 +1264,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
