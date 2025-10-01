@@ -715,75 +715,58 @@ app.get('/price', async (req, res) => {
 
     // Click the exact block (bounded inside helper)
     if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_click');
-    const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
-    debug.clicked = !!(clickRes && clickRes.clicked);
-    debug.steps.push(`clicked_${debug.clicked ? 'ok' : 'fail'}`);
+   // click the slot
+const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
+debug.clicked = clickRes.clicked;
+debug.courtName = clickRes.courtName || debug.courtName || null;
 
-    if (!debug.clicked) {
-      debug.popupWhy = 'not_clicked';
-      return res.json({
-        slug, date, resourceId,
-        startTime: startHH,
-        endTime: endHH,
-        price: '? EUR',
-        debug
-      });
-    }
+if (!debug.clicked) {
+  debug.popupWhy = 'not_clicked';
+  return res.json({
+    slug, date, resourceId,
+    startTime: startHH,
+    endTime: endHH,
+    price: '? EUR',
+    source: 'popup',
+    debug
+  });
+}
 
-    // Anchor the *correct* popup by header time + (if known) court name
-    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_popup');
-    const picked = await pickPopupByStartAndName(page, startHH, debug.courtName, Math.max(500, hardDeadline - Date.now()));
-    if (!picked) {
-      debug.popupWhy = 'popup_not_found_for_start_and_name';
-      return res.json({
-        slug, date, resourceId,
-        startTime: startHH,
-        endTime: endHH,
-        price: '? EUR',
-        debug
-      });
-    }
-    debug.popupHeader = { leftName: picked.leftName, rightTime: picked.rightTime };
+// read popup by matching header (time + fuzzy court name)
+const popup = await readPopupDurations(page, debug.courtName, startHH, 3500);
+if (!popup) {
+  debug.popupWhy = 'popup_not_found_for_start_and_name';
+  debug.popupHeader = null;
+  debug.popupDurations = [];
+  debug.chosen = null;
+  return res.json({
+    slug, date, resourceId,
+    startTime: startHH,
+    endTime: endHH,
+    price: '? EUR',
+    source: 'popup',
+    debug
+  });
+}
 
-    // Read rows (duration → price) strictly from that popup
-    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_readrows');
-    const rows = await readRowsFromPopup(picked.popup);
-    if (!rows || rows.length === 0) {
-      debug.popupWhy = 'rows_not_found';
-      return res.json({
-        slug, date, resourceId,
-        startTime: startHH,
-        endTime: endHH,
-        price: '? EUR',
-        debug
-      });
-    }
+debug.popupWhy = 'ok';
+debug.popupHeader = { name: popup.name, time: popup.time };
+debug.popupDurations = popup.rows;
 
-    const priceByMin = new Map();
-    for (const [label, price] of rows) {
-      const mins = toMinutes(label);
-      if (mins != null && !priceByMin.has(mins)) priceByMin.set(mins, price);
-    }
-    debug.popupDurations = Array.from(priceByMin.keys()).sort((a,b)=>a-b);
+let chosen = null;
+if (popup.rows && popup.rows.length) {
+  // exact match only
+  chosen = popup.rows.find(r => r.minutes === duration) || null;
+}
+debug.chosen = chosen;
 
-    const chosen = priceByMin.get(duration) || null;
-    debug.chosen = chosen;
-
-    return res.json({
-      slug, date, resourceId,
-      startTime: startHH,
-      endTime: endHH,
-      price: chosen || '? EUR',
-      debug
-    });
-
-  } catch (e) {
-    const msg = String(e && e.message || e);
-    return res.status(500).json({ error: 'price failed', detail: msg, debug });
-  } finally {
-    try { await page?.close(); } catch {}
-    try { await context?.close(); } catch {}
-  }
+return res.json({
+  slug, date, resourceId,
+  startTime: startHH,
+  endTime: endHH,
+  price: chosen ? chosen.price : '? EUR',
+  source: 'popup',
+  debug
 });
 
 
@@ -809,6 +792,98 @@ function hhVariants(hhmm) {
   const v2 = `${String(H).padStart(2,'0')}:${M}`;
   return [...new Set([v1, v2])];
 }
+
+// Read the visible popup for the clicked slot.
+// Matches by start time and (fuzzy) court name; then extracts all duration rows.
+// Returns { name, time, rows:[{label, minutes, price}] } or null.
+async function readPopupDurations(page, expectCourt, expectStart, timeoutMs = 3500) {
+  const deadline = Date.now() + timeoutMs;
+
+  function normName(s) { return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
+  function toHMM(s) {
+    const m = /(\d{1,2}):(\d{2})/.exec(String(s || ''));
+    if (!m) return null;
+    return `${parseInt(m[1], 10)}:${m[2]}`;
+  }
+  const wantName = expectCourt ? normName(expectCourt) : null;
+  const wantTime = expectStart ? toHMM(expectStart) : null;
+
+  while (Date.now() < deadline) {
+    const found = await page.evaluate(({ wantName, wantTime }) => {
+      const normName = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const toHMM = s => {
+        const m = /(\d{1,2}):(\d{2})/.exec(String(s || ''));
+        if (!m) return null;
+        return `${parseInt(m[1], 10)}:${m[2]}`;
+      };
+
+      const popups = Array.from(document.querySelectorAll('div.absolute'));
+      const candidates = [];
+
+      for (const el of popups) {
+        // crude visible check
+        const r = el.getBoundingClientRect();
+        const visible = r.width > 180 && r.height > 80 && r.bottom > 0 && r.right > 0;
+        if (!visible) continue;
+
+        // header: row with two DIV children, time on the right
+        let name = null, time = null;
+        // try `.font-bold` first
+        let header = el.querySelector('.font-bold');
+        // fallback: any row with two children where right looks like time
+        if (!header) {
+          header = Array.from(el.querySelectorAll('div')).find(d => {
+            const kids = Array.from(d.children).filter(n => n.tagName === 'DIV');
+            if (kids.length < 2) return false;
+            return !!toHMM(kids[1].textContent || '');
+          }) || null;
+        }
+        if (header) {
+          const kids = Array.from(header.children).filter(n => n.tagName === 'DIV');
+          if (kids.length >= 2) {
+            name = normName(kids[0].textContent || '');
+            time = toHMM(kids[1].textContent || '');
+          }
+        }
+        if (!time) continue;
+
+        const matchName = !wantName || name.includes(wantName) || wantName.includes(name);
+        const matchTime = !wantTime || time === wantTime;
+        if (!(matchName && matchTime)) continue;
+
+        // rows: two-child flex rows "1h 30m" | "36 EUR"
+        const rows = [];
+        const rowNodes = Array.from(el.querySelectorAll('div')).filter(d => {
+          const kids = Array.from(d.children).filter(n => n.tagName === 'DIV');
+          if (kids.length !== 2) return false;
+          const left  = kids[0].textContent || '';
+          const right = kids[1].textContent || '';
+          return /\d+\s*h\s*\d{2}\s*m/i.test(left) && /[0-9].*(EUR|€)/i.test(right);
+        });
+        for (const rn of rowNodes) {
+          const kids = Array.from(rn.children).filter(n => n.tagName === 'DIV');
+          const label = (kids[0].textContent || '').replace(/\s+/g, ' ').trim();
+          const price = (kids[1].textContent || '').replace(/\s+/g, ' ').trim();
+          const m = /(\d+)\s*h\s*(\d{2})\s*m/i.exec(label);
+          const minutes = m ? (parseInt(m[1], 10) * 60 + parseInt(m[2], 10)) : null;
+          rows.push({ label, minutes, price });
+        }
+
+        candidates.push({ name, time, rows });
+      }
+
+      return candidates;
+    }, { wantName, wantTime });
+
+    if (found && found.length) {
+      // take the first matching visible popup
+      return found[0];
+    }
+    await page.waitForTimeout(120);
+  }
+  return null;
+}
+
 
 async function scrollGridToTop(page) {
   try {
@@ -1038,18 +1113,19 @@ async function readPriceFromDOM(page, timeoutMs = 4500) {
 
 
 // Click a specific slot by resourceId + start + end, tolerant of "H:MM" vs "HH:MM".
+// Returns { clicked: boolean, where: string|null, courtName: string|null }
 async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 24) {
-  function norm(hhmm) {
+  function toHMM(hhmm) {
     const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || ''));
     if (!m) return null;
-    return `${parseInt(m[1], 10)}:${m[2]}`; // strip any leading zero on hours
+    return `${parseInt(m[1], 10)}:${m[2]}`; // strip leading zero in hours
   }
-  const wantStart = norm(startHH);
-  const wantEnd   = norm(endHH);
+  const wantStart = toHMM(startHH);
+  const wantEnd   = toHMM(endHH);
 
   async function tryClickOnce() {
     return await page.evaluate(({ rid, s, e }) => {
-      function norm2(x) {
+      function norm(x) {
         const m = /^(\d{1,2}):(\d{2})$/.exec(String(x || ''));
         if (!m) return null;
         return `${parseInt(m[1], 10)}:${m[2]}`;
@@ -1057,19 +1133,26 @@ async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 24
       const nodes = document.querySelectorAll('div[data-court-id][data-start-hour][data-end-hour]');
       for (const el of nodes) {
         if (el.getAttribute('data-court-id') !== rid) continue;
-        const st = norm2(el.getAttribute('data-start-hour'));
-        const en = norm2(el.getAttribute('data-end-hour'));
+        const st = norm(el.getAttribute('data-start-hour'));
+        const en = norm(el.getAttribute('data-end-hour'));
         if (st === s && en === e) {
+          // try to read the court name from the left label in the same row
+          let courtName = null;
+          try {
+            const row = el.closest('div.flex.border-b.ui-stroke-neutral-default');
+            courtName = (row?.querySelector('.truncate')?.textContent || '').trim() || null;
+          } catch {}
           try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
-          try { el.click(); return true; } catch {}
+          try { el.click(); return { ok: true, courtName }; } catch {}
         }
       }
-      return false;
+      return { ok: false, courtName: null };
     }, { rid: resourceId, s: wantStart, e: wantEnd });
   }
 
   // Try current viewport first
-  if (await tryClickOnce()) return { clicked: true, where: 'initial' };
+  const first = await tryClickOnce();
+  if (first?.ok) return { clicked: true, where: 'initial', courtName: first.courtName };
 
   // Bounded downward sweeps through the scroll container
   for (let i = 0; i < maxSweeps; i++) {
@@ -1098,11 +1181,12 @@ async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 24
     }).catch(() => false);
 
     await page.waitForTimeout(120);
-    if (await tryClickOnce()) return { clicked: true, where: `sweep_${i + 1}` };
-    if (!moved) break; // reached the end
+    const again = await tryClickOnce();
+    if (again?.ok) return { clicked: true, where: `sweep_${i+1}`, courtName: again.courtName };
+    if (!moved) break; // reached end
   }
 
-  return { clicked: false };
+  return { clicked: false, where: null, courtName: null };
 }
 
 
@@ -1588,6 +1672,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
