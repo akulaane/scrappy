@@ -604,43 +604,60 @@ app.get('/price', async (req, res) => {
     } catch { return null; }
   }
 
-  // Find the tooltip whose header is: <div class="... font-bold"><div>NAME</div><div>HH:MM</div></div>
-  async function findTooltipByHeader(page, expectName, expectStart, timeoutMs = 4500) {
-    const deadline = Date.now() + timeoutMs;
-    const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
-    const toHMM = s => {
-      const m = /(\d{1,2}):(\d{2})/.exec(String(s||'')); if (!m) return null;
-      return `${parseInt(m[1],10)}:${m[2]}`; // strip leading zero
-    };
-    const wantName = expectName ? norm(expectName) : null;
-    const wantTime = toHMM(expectStart);
+// Find the tooltip whose header shows: <div class="... font-bold"><div>NAME</div><div>HH:MM</div></div>
+// We do NOT require a "Continue" button anymore.
+async function findTooltipByHeader(page, expectName, expectStart, timeoutMs = 4500) {
+  const deadline = Date.now() + timeoutMs;
 
-    while (Date.now() < deadline) {
-      const pops = page.locator('div.absolute')
-        .filter({ has: page.getByRole('button', { name: /continue/i }) });
-      const n = await pops.count().catch(()=>0);
+  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
+  const toHMM = s => {
+    const m = /(\d{1,2}):(\d{2})/.exec(String(s||'')); 
+    return m ? `${parseInt(m[1],10)}:${m[2]}` : null; // strip leading zero in hours
+  };
+  const wantName = expectName ? norm(expectName) : null;
+  const wantTime = toHMM(expectStart);
 
-      for (let i = 0; i < n; i++) {
-        const p = pops.nth(i);
-        const header = p.locator('.flex.flex-row.justify-between.font-bold');
-        if (!(await header.count().catch(()=>0))) continue;
+  // Candidate containers for the floating tooltip
+  const containerSel = [
+    'div.absolute',
+    'div[style*="position: absolute"]',
+    '[role="tooltip"]',
+  ].join(', ');
 
-        const kids = header.locator(':scope > div');
-        if ((await kids.count().catch(()=>0)) < 2) continue;
+  while (Date.now() < deadline) {
+    const pops = page.locator(containerSel);
+    const n = await pops.count().catch(() => 0);
 
-        const leftName  = (await kids.nth(0).innerText().catch(()=>'')) || '';
-        const rightTime = (await kids.nth(1).innerText().catch(()=>'')) || '';
+    for (let i = 0; i < n; i++) {
+      const p = pops.nth(i);
+      // must be visible & reasonably sized
+      try { await p.waitFor({ state: 'visible', timeout: 100 }); } catch {}
 
-        const nameOk = !wantName || norm(leftName).includes(wantName) || wantName.includes(norm(leftName));
-        const timeOk = !wantTime || toHMM(rightTime) === wantTime;
-
-        if (nameOk && timeOk) return p;
+      // header: try the known class first, then any row with two <div> children where the right is time
+      let header = p.locator('.flex.flex-row.justify-between.font-bold').first();
+      if (!(await header.count())) {
+        header = p.locator('div').filter({
+          has: page.locator(':scope > div:nth-child(2)', { hasText: /\b\d{1,2}:\d{2}\b/ })
+        }).first();
       }
+      if (!(await header.count())) continue;
 
-      await page.waitForTimeout(120);
+      const kids = header.locator(':scope > div');
+      if ((await kids.count().catch(()=>0)) < 2) continue;
+
+      const leftName  = (await kids.nth(0).innerText().catch(()=>'')) || '';
+      const rightTime = (await kids.nth(1).innerText().catch(()=>'')) || '';
+
+      const nameOk = !wantName || norm(leftName).includes(wantName) || wantName.includes(norm(leftName));
+      const timeOk = !wantTime || toHMM(rightTime) === wantTime;
+      if (nameOk && timeOk) return p;
     }
-    return null;
+
+    await page.waitForTimeout(120);
   }
+  return null;
+}
+
 
   // Extract rows like  ["1h 30m","54 EUR"] from the chosen tooltip node
   async function readRowsFromTooltip(tip) {
@@ -729,6 +746,7 @@ app.get('/price', async (req, res) => {
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = !!clickRes?.clicked;
     debug.courtName = clickRes?.courtName || debug.courtName || null;
+     await page.waitForTimeout(180);
 
     if (!debug.clicked) {
       return res.json({
@@ -1738,6 +1756,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
