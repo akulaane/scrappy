@@ -538,9 +538,19 @@ perClubItems.push({
   }
 });
 
+
 /* =========================
-   Single-slot price verifier — simple & strict
+   Single-slot price verifier (header-anchored popup)
    ========================= */
+
+// GET /price
+// Params:
+//   slug        = club slug (e.g. "padelikeskus")   [required]
+//   date        = YYYY-MM-DD                        [required]
+//   resourceId  = court resource UUID               [required]
+//   start       = "HH:MM"                           [required]
+//   end         = "HH:MM"                           [preferred]
+//   duration    = 60|90|120                         [fallback if end not provided]
 app.get('/price', async (req, res) => {
   const BASE = 'https://playtomic.com';
 
@@ -551,179 +561,142 @@ app.get('/price', async (req, res) => {
   let   endHH      = normHHMM(String(req.query.end   || ''));
   let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
-  // ---- tiny helpers (pure)
-  const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
-  const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
-  const diffMin = (a,b) => ((b - a + 1440) % 1440);
-  const hhVariants = (hhmm) => {
-    const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || ''));
-    if (!m) return [String(hhmm || '')];
-    const H = parseInt(m[1], 10), M = m[2];
-    return [...new Set([`${H}:${M}`, `${String(H).padStart(2,'0')}:${M}`])];
-  };
-
+  // Quick sanity
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
 
-  // prefer duration if both provided but disagree
-  if (endHH && duration) {
-    const inferred = diffMin(hmToMin(startHH), hmToMin(endHH));
-    if (Math.abs(inferred - duration) >= 5) {
-      endHH = minToHHMM(hmToMin(startHH) + duration);
-    }
-  }
-  if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
-  if (!duration && endHH) duration = diffMin(hmToMin(startHH), hmToMin(endHH));
+  // Use global helpers if present
+  const haveHmToMin = typeof hmToMin === 'function';
+  const haveMinToHH = typeof minToHHMM === 'function';
+
+  const _hmToMin   = haveHmToMin ? hmToMin : (s) => { const [h,m]=String(s).split(':').map(Number); return (h|0)*60+(m|0); };
+  const _minToHHMM = haveMinToHH ? minToHHMM : (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
+
+  // Derive end/duration
+  if (!endHH && duration) endHH = _minToHHMM(_hmToMin(startHH) + duration);
+  if (!duration && endHH) duration = ((_hmToMin(endHH) - _hmToMin(startHH) + 1440) % 1440);
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
 
-  // Normalize duration to 60/90/120 if slightly off
-  const allowed = [60, 90, 120];
-  if (!allowed.includes(duration)) {
-    duration = allowed.reduce((best, v) =>
-      Math.abs(v - duration) < Math.abs(best - duration) ? v : best, allowed[0]);
+  // Snap duration to [60,90,120] if off by a minute or two (DST / UI fuzz)
+  const allowedDur = [60, 90, 120];
+  if (!allowedDur.includes(duration)) {
+    const nearest = allowedDur.reduce((best, v) =>
+      Math.abs(v - duration) < Math.abs(best - duration) ? v : best, allowedDur[0]);
+    duration = nearest;
+    endHH = _minToHHMM(_hmToMin(startHH) + duration);
   }
 
-  // ---- local minimal helpers (route-private)
-  async function getGridScroller(page) {
-    const handle = await page.evaluateHandle(() => {
-      const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
-      const getScrollableParent = (el) => {
-        let p = el?.parentElement;
-        while (p) {
-          const cs = getComputedStyle(p);
-          if (/(auto|scroll)/.test(cs.overflowY)) return p;
-          p = p.parentElement;
-        }
-        return null;
-      };
-      return sample ? getScrollableParent(sample) : (document.scrollingElement || document.body);
-    });
-    return handle;
+  // ---------- Small, self-contained helpers used only by this route ----------
+
+  // Read the court name from the row that contains this resourceId (left label)
+  async function getCourtNameForResource(page, rid) {
+    try {
+      return await page.evaluate((resourceId) => {
+        const block = document.querySelector(`div[data-court-id="${resourceId}"]`);
+        if (!block) return null;
+        const row = block.closest('div.flex.border-b');
+        const name = row?.querySelector('.truncate')?.textContent || '';
+        return name.replace(/\u00a0/g, ' ').trim() || null;
+      }, rid);
+    } catch { return null; }
   }
 
-  async function queryBlockLocator(page, rid, start, end) {
-    // try both H:MM and HH:MM variants
-    for (const s of hhVariants(start)) {
-      for (const e of hhVariants(end)) {
-        let base = page.locator(`div[data-court-id="${rid}"][data-start-hour="${s}"][data-end-hour="${e}"]`);
-        if (await base.count()) {
-          const abs = base.locator('xpath=.//div[contains(@class,"absolute")]').first();
-          if (await abs.count()) return abs;
-          return base.first();
-        }
+  // Find the tooltip whose header is: <div class="... font-bold"><div>NAME</div><div>HH:MM</div></div>
+  async function findTooltipByHeader(page, expectName, expectStart, timeoutMs = 4500) {
+    const deadline = Date.now() + timeoutMs;
+    const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
+    const toHMM = s => {
+      const m = /(\d{1,2}):(\d{2})/.exec(String(s||'')); if (!m) return null;
+      return `${parseInt(m[1],10)}:${m[2]}`; // strip leading zero
+    };
+    const wantName = expectName ? norm(expectName) : null;
+    const wantTime = toHMM(expectStart);
+
+    while (Date.now() < deadline) {
+      const pops = page.locator('div.absolute')
+        .filter({ has: page.getByRole('button', { name: /continue/i }) });
+      const n = await pops.count().catch(()=>0);
+
+      for (let i = 0; i < n; i++) {
+        const p = pops.nth(i);
+        const header = p.locator('.flex.flex-row.justify-between.font-bold');
+        if (!(await header.count().catch(()=>0))) continue;
+
+        const kids = header.locator(':scope > div');
+        if ((await kids.count().catch(()=>0)) < 2) continue;
+
+        const leftName  = (await kids.nth(0).innerText().catch(()=>'')) || '';
+        const rightTime = (await kids.nth(1).innerText().catch(()=>'')) || '';
+
+        const nameOk = !wantName || norm(leftName).includes(wantName) || wantName.includes(norm(leftName));
+        const timeOk = !wantTime || toHMM(rightTime) === wantTime;
+
+        if (nameOk && timeOk) return p;
       }
-    }
-    return null;
-  }
 
-  async function clickExactBlock(page, rid, start, end, sweeps = 30) {
-    // try in current viewport first
-    let loc = await queryBlockLocator(page, rid, start, end);
-    if (loc && await loc.count()) {
-      try { await loc.scrollIntoViewIfNeeded(); } catch {}
-      await loc.click({ force: true }).catch(()=>{});
-      return true;
-    }
-    // sweep down the grid to trigger virtualization rendering
-    for (let i = 0; i < sweeps; i++) {
-      const sc = await getGridScroller(page);
-      const moved = await page.evaluate(sc => {
-        const before = sc ? sc.scrollTop : window.scrollY;
-        const delta = Math.floor((sc ? sc.clientHeight : window.innerHeight) * 0.9);
-        if (sc) sc.scrollTop = Math.min(sc.scrollHeight, before + delta);
-        else window.scrollTo(0, before + delta);
-        return (sc ? sc.scrollTop : window.scrollY) !== before;
-      }, sc).catch(() => false);
-      try { await sc?.dispose(); } catch {}
       await page.waitForTimeout(120);
-
-      loc = await queryBlockLocator(page, rid, start, end);
-      if (loc && await loc.count()) {
-        try { await loc.scrollIntoViewIfNeeded(); } catch {}
-        await loc.click({ force: true }).catch(()=>{});
-        return true;
-      }
-      if (!moved) break; // reached end
-    }
-    return false;
-  }
-
-  async function waitForTooltip(page, timeoutMs = 4000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
-      // the popup container you showed is an absolutely positioned div that contains a Continue button
-      const tip = page.locator('div.absolute').filter({ has: page.getByRole('button', { name: /continue/i }) }).first();
-      if (await tip.isVisible().catch(()=>false)) return tip;
-      await page.waitForTimeout(100);
     }
     return null;
   }
 
+  // Extract rows like  ["1h 30m","54 EUR"] from the chosen tooltip node
   async function readRowsFromTooltip(tip) {
-    // First try the explicit row pattern you pasted.
-    let rows = await tip.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
-    if (!rows.length) {
-      // Fallback: any two-div row with duration on the left and money on the right
-      rows = await tip.locator('div').all().catch(()=>[]);
-    }
+    const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+    const rows = [];
 
-    const norm = s => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
-    const out = [];
-    for (const r of rows) {
+    // Try the obvious row selector first
+    const candidates = await tip.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
+    const scan = candidates.length ? candidates : await tip.locator('div').all().catch(()=>[]);
+
+    for (const r of scan) {
       const kids = r.locator(':scope > div');
-      if ((await kids.count()) !== 2) continue;
-      const left  = norm(await kids.nth(0).innerText().catch(()=>'')); // "1h 30m"
-      const right = norm(await kids.nth(1).innerText().catch(()=>'')); // "54 EUR"
+      if ((await kids.count().catch(()=>0)) !== 2) continue;
+
+      const left  = norm(await kids.nth(0).innerText().catch(()=>'')); // "2h 00m"
+      const right = norm(await kids.nth(1).innerText().catch(()=>'')); // "72 EUR"
 
       const looksDur   = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
       const looksMoney = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
       if (!looksDur || !looksMoney) continue;
 
+      // parse minutes from "Xh YYm" | "Xh" | "YYm"
       let minutes = null, m;
       const s = left.toLowerCase();
       if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) minutes = (+m[1])*60 + (+m[2]);
       else if ((m = s.match(/(\d+)\s*h(?![a-z])/)))  minutes = (+m[1])*60;
       else if ((m = s.match(/(\d{1,3})\s*m/)))       minutes = (+m[1]);
 
-      if (minutes) out.push({ label: left, minutes, price: right });
+      if (minutes) rows.push({ label: left, minutes, price: right });
     }
-    return out;
+    return rows;
   }
 
-  async function readContinuePrice(page, timeoutMs = 1500) {
-    const t0 = Date.now(), moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
-    while (Date.now() - t0 < timeoutMs) {
-      const btn = page.getByRole('button', { name: /continue/i }).first();
-      if (await btn.count()) {
-        const txt = (await btn.textContent()) || '';
-        const m = txt.match(moneyRe);
-        if (m) return m[0].replace(/\s+/g, ' ').trim();
-      }
-      await page.waitForTimeout(100);
-    }
-    return null;
-  }
+  // --------------------------------------------------------------------------
 
-  // ---- main
   const debug = {
     slug, date, resourceId, startHH, endHH, duration,
     url: `${BASE}/clubs/${encodeURIComponent(slug)}`,
     steps: [],
     clicked: false,
-    tooltip: null,
+    courtName: null,
+    tooltipFound: false,
+    tooltipHeaderMatch: { name: null, time: null },
     rows: [],
     chosen: null
   };
+
+  const HARD_DEADLINE_MS = 15000;
+  const deadline = Date.now() + HARD_DEADLINE_MS;
 
   let context, page;
   try {
     context = await newContext();
     page = await context.newPage();
 
-    // light filtering for speed
+    // Trim trackers
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -734,17 +707,29 @@ app.get('/price', async (req, res) => {
       route.continue();
     });
 
-    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForSelector('#__next', { timeout: 15000 }).catch(()=>{});
-    await autoDismissConsent(page).catch(()=>{});
+    // Nav + hydrate
+    if (Date.now() > deadline) throw new Error('timeout_before_nav');
+    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: Math.max(1, deadline - Date.now()) });
+    await page.waitForSelector('#__next', { timeout: Math.max(1, deadline - Date.now()) }).catch(() => {});
+    await autoDismissConsent(page).catch(() => {});
+    await page.evaluate(() => window.scrollTo(0, 0)).catch(()=>{});
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
+    // Pick date
+    if (Date.now() > deadline) throw new Error('timeout_before_date');
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // 1) click the exact block by attributes (strict)
-    debug.clicked = await clickExactBlock(page, resourceId, startHH, endHH, 36);
+    // Row court name (used to anchor correct tooltip)
+    debug.courtName = await getCourtNameForResource(page, resourceId);
+
+    // Click exact slot (resourceId + start + end)
+    if (Date.now() > deadline) throw new Error('timeout_before_click');
+    const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
+    debug.clicked = !!clickRes?.clicked;
+    debug.courtName = clickRes?.courtName || debug.courtName || null;
+
     if (!debug.clicked) {
       return res.json({
         slug, date, resourceId,
@@ -755,33 +740,39 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // 2) wait for the tooltip created by the click
-    const tip = await waitForTooltip(page, 4000);
+    // Find the *right* tooltip by header (court name + start time)
+    const tip = await findTooltipByHeader(page, debug.courtName, startHH, Math.max(800, deadline - Date.now()));
     if (!tip) {
       return res.json({
         slug, date, resourceId,
         startTime: startHH, endTime: endHH,
         price: '? EUR',
-        source: 'no_tooltip',
-        debug: { ...debug, tooltip: 'not_found' }
+        source: 'tooltip_not_found',
+        debug
       });
     }
-    debug.tooltip = 'found';
+    debug.tooltipFound = true;
 
-    // 3) read rows and pick the requested duration
+    // Record header we matched (for transparency)
+    try {
+      const header = tip.locator('.flex.flex-row.justify-between.font-bold');
+      const kids = header.locator(':scope > div');
+      debug.tooltipHeaderMatch.name = (await kids.nth(0).innerText().catch(()=>null)) || null;
+      debug.tooltipHeaderMatch.time = (await kids.nth(1).innerText().catch(()=>null)) || null;
+    } catch {}
+
+    // Read duration/price rows and pick the one for our requested duration
     const rows = await readRowsFromTooltip(tip);
     debug.rows = rows;
     const chosen = rows.find(r => r.minutes === duration) || null;
     debug.chosen = chosen;
 
-    let price = chosen?.price || null;
-    if (!price) price = await readContinuePrice(page, 1200); // last resort
-
     return res.json({
       slug, date, resourceId,
-      startTime: startHH, endTime: endHH,
-      price: price || '? EUR',
-      source: chosen ? 'popup_row' : (price ? 'continue_btn' : 'popup'),
+      startTime: startHH,
+      endTime: endHH,
+      price: chosen ? chosen.price : '? EUR',
+      source: chosen ? 'popup_row' : 'popup',
       debug
     });
 
@@ -792,6 +783,10 @@ app.get('/price', async (req, res) => {
     try { await context?.close(); } catch {}
   }
 });
+
+
+
+
 
 
 
@@ -816,6 +811,82 @@ function hhVariants(hhmm) {
   const v2 = `${String(H).padStart(2,'0')}:${M}`;
   return [...new Set([v1, v2])];
 }
+
+// Read the court name for a resource row (left label of the row)
+async function getCourtNameForResource(page, resourceId) {
+  try {
+    return await page.evaluate((rid) => {
+      const block = document.querySelector(`div[data-court-id="${rid}"]`);
+      if (!block) return null;
+      const row = block.closest('div.flex.border-b');
+      const name = row?.querySelector('.truncate')?.textContent || '';
+      return name.replace(/\u00a0/g, ' ').trim() || null;
+    }, resourceId);
+  } catch { return null; }
+}
+
+// Find the *right* popup by matching header: left=name, right=start time.
+async function findTooltipByHeader(page, expectName, expectStart, timeoutMs = 4500) {
+  const deadline = Date.now() + timeoutMs;
+  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
+  const toHMM = s => {
+    const m = /(\d{1,2}):(\d{2})/.exec(String(s||'')); if (!m) return null;
+    return `${parseInt(m[1],10)}:${m[2]}`; // strip leading zero
+  };
+  const wantName = expectName ? norm(expectName) : null;
+  const wantTime = toHMM(expectStart);
+
+  while (Date.now() < deadline) {
+    // Only popups that contain a Continue button.
+    const pops = page.locator('div.absolute').filter({ has: page.getByRole('button', { name: /continue/i }) });
+    const n = await pops.count().catch(()=>0);
+    for (let i = 0; i < n; i++) {
+      const p = pops.nth(i);
+      // header like: <div class="flex ... font-bold"><div>NAME</div><div>HH:MM</div></div>
+      const header = p.locator('.flex.flex-row.justify-between.font-bold');
+      if (!(await header.count())) continue;
+
+      const kids = header.locator(':scope > div');
+      if ((await kids.count()) < 2) continue;
+
+      const leftName  = norm(await kids.nth(0).innerText().catch(()=>''));  // court name
+      const rightTime = toHMM(await kids.nth(1).innerText().catch(()=>'')); // start time
+
+      const nameOk = !wantName || leftName.includes(wantName) || wantName.includes(leftName);
+      const timeOk = !wantTime || rightTime === wantTime;
+
+      if (timeOk && nameOk) return p;
+    }
+    await page.waitForTimeout(120);
+  }
+  return null;
+}
+
+// Read duration rows from a specific tooltip node
+async function readRowsFromTooltip(tip) {
+  const rows = await tip.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
+  const scan = rows.length ? rows : await tip.locator('div').all().catch(()=>[]);
+  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+  const out = [];
+  for (const r of scan) {
+    const kids = r.locator(':scope > div');
+    if ((await kids.count()) !== 2) continue;
+    const left  = norm(await kids.nth(0).innerText().catch(()=>'')); // e.g. "2h 00m"
+    const right = norm(await kids.nth(1).innerText().catch(()=>'')); // e.g. "72 EUR"
+    const looksDur   = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
+    const looksMoney = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
+    if (!looksDur || !looksMoney) continue;
+
+    let minutes = null, m; const s = left.toLowerCase();
+    if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) minutes = (+m[1])*60 + (+m[2]);
+    else if ((m = s.match(/(\d+)\s*h(?![a-z])/)))  minutes = (+m[1])*60;
+    else if ((m = s.match(/(\d{1,3})\s*m/)))       minutes = (+m[1]);
+
+    if (minutes) out.push({ label: left, minutes, price: right });
+  }
+  return out;
+}
+
 
 // Duration → visible label (60 -> "1h 00m", etc.) – only used if you keep selectDurationOption
 function formatDurationLabel(mins) {
@@ -1667,6 +1738,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
