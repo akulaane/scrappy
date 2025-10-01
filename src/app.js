@@ -985,28 +985,6 @@ function formatDurationLabel(mins) {
 }
 
 
-// Read the price from the "Continue – XX EUR" button and let it settle
-async function readContinuePrice(page, settleMs = 350, timeoutMs = 5000) {
-  const moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
-  let last = null, lastChange = Date.now();
-  const end = Date.now() + timeoutMs;
-
-  while (Date.now() < end) {
-    const btn = page.getByRole('button', { name: /continue/i }).first();
-    if (await btn.count()) {
-      const txt = (await btn.textContent()) || '';
-      const m = txt.match(moneyRe);
-      if (m) {
-        const val = m[0].replace(/\s+/g,' ').trim();
-        if (val !== last) { last = val; lastChange = Date.now(); }
-        if (Date.now() - lastChange >= settleMs) return last; // stable enough
-      }
-    }
-    await page.waitForTimeout(120);
-  }
-  return last;
-}
-
 
 
 // Turn minutes into the label Playtomic shows, e.g. 60 -> "1h 00m", 90 -> "1h 30m"
@@ -1654,6 +1632,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
