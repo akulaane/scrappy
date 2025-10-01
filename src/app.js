@@ -518,9 +518,8 @@ app.get('/availability', async (req, res) => {
   }
 });
 
-/* =========================
-   Single-slot price verifier
-   ========================= */
+
+
 // GET /price
 // Params:
 //   slug        = club slug (e.g. "padelikeskus")   [required]
@@ -539,17 +538,19 @@ app.get('/price', async (req, res) => {
   let   endHH      = normHHMM(String(req.query.end   || ''));
   let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
+  // Quick sanity
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
 
+  // Derive end/duration
   if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
   if (!duration && endHH) duration = ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
 
-  // Snap duration to [60,90,120] if fuzzed
+  // Snap duration to [60,90,120] if off by a minute or two
   const allowedDur = [60, 90, 120];
   if (!allowedDur.includes(duration)) {
     const nearest = allowedDur.reduce((best, v) =>
@@ -567,7 +568,8 @@ app.get('/price', async (req, res) => {
     tooltipFound: false,
     tooltipHeaderMatch: { name: null, time: null },
     rows: [],
-    chosen: null
+    chosen: null,
+    fallbacks: {}
   };
 
   const HARD_DEADLINE_MS = 15000;
@@ -606,7 +608,7 @@ app.get('/price', async (req, res) => {
     // Row court name (used to anchor correct tooltip)
     debug.courtName = await getCourtNameForResource(page, resourceId);
 
-    // Click exact slot
+    // Click exact slot (resourceId + start + end)
     if (Date.now() > deadline) throw new Error('timeout_before_click');
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = !!clickRes?.clicked;
@@ -614,6 +616,16 @@ app.get('/price', async (req, res) => {
     await page.waitForTimeout(180);
 
     if (!debug.clicked) {
+      // fallback 1: availability JSON
+      const jPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration).catch(()=>null);
+      if (jPrice) {
+        debug.fallbacks.availability_json = true;
+        return res.json({
+          slug, date, resourceId, startTime: startHH, endTime: endHH,
+          price: jPrice, source: 'availability_json', debug
+        });
+      }
+      // no price
       return res.json({
         slug, date, resourceId,
         startTime: startHH, endTime: endHH,
@@ -623,44 +635,66 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // Find the *right* tooltip by header (court name + start time) — tolerant, no "Continue" required
-    const tip = await findTooltipByHeader(page, debug.courtName, startHH, Math.max(800, deadline - Date.now()));
-    if (!tip) {
+    // === NEW robust popup finder (tolerant to different HTML structures) ===
+    const tip = await findBookingPopup(page, { courtName: debug.courtName, startHH }, Math.max(900, deadline - Date.now()));
+    if (tip) {
+      debug.tooltipFound = true;
+
+      // best-effort header capture
+      try {
+        let header = tip.locator('.flex.flex-row.justify-between.font-bold').first();
+        if (!(await header.count())) {
+          header = tip.locator('div').filter({
+            has: page.locator(':scope > div:nth-child(2)', { hasText: /\b\d{1,2}:\d{2}\b/ })
+          }).first();
+        }
+        const kids = header.locator(':scope > div');
+        debug.tooltipHeaderMatch.name = (await kids.nth(0).innerText().catch(()=>null)) || null;
+        debug.tooltipHeaderMatch.time = (await kids.nth(1).innerText().catch(()=>null)) || null;
+      } catch {}
+
+      const rows = await readRowsFromTooltip(tip);
+      debug.rows = rows;
+      const chosen = rows.find(r => r.minutes === duration) || null;
+      debug.chosen = chosen;
+
+      if (chosen) {
+        return res.json({
+          slug, date, resourceId,
+          startTime: startHH, endTime: endHH,
+          price: chosen.price,
+          source: 'popup_row',
+          debug
+        });
+      }
+    }
+
+    // fallback 2: Availability JSON (server responses)
+    const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration).catch(()=>null);
+    if (jsonPrice) {
+      debug.fallbacks.availability_json = true;
       return res.json({
-        slug, date, resourceId,
-        startTime: startHH, endTime: endHH,
-        price: '? EUR',
-        source: 'tooltip_not_found',
-        debug
+        slug, date, resourceId, startTime: startHH, endTime: endHH,
+        price: jsonPrice, source: 'availability_json', debug
       });
     }
-    debug.tooltipFound = true;
 
-    // Record header we matched (for transparency)
-    try {
-      let header = tip.locator('.flex.flex-row.justify-between.font-bold').first();
-      if (!(await header.count())) {
-        header = tip.locator('div').filter({
-          has: page.locator(':scope > div:nth-child(2)', { hasText: /\b\d{1,2}:\d{2}\b/ })
-        }).first();
-      }
-      const kids = header.locator(':scope > div');
-      debug.tooltipHeaderMatch.name = (await kids.nth(0).innerText().catch(()=>null)) || null;
-      debug.tooltipHeaderMatch.time = (await kids.nth(1).innerText().catch(()=>null)) || null;
-    } catch {}
+    // fallback 3: "Continue XX EUR" button text (if present)
+    const btnPrice = await readContinuePrice(page, 2000);
+    if (btnPrice) {
+      debug.fallbacks.continue_button = true;
+      return res.json({
+        slug, date, resourceId, startTime: startHH, endTime: endHH,
+        price: btnPrice, source: 'continue_button', debug
+      });
+    }
 
-    // Read duration/price rows and pick the one for our requested duration
-    const rows = await readRowsFromTooltip(tip);
-    debug.rows = rows;
-    const chosen = rows.find(r => r.minutes === duration) || null;
-    debug.chosen = chosen;
-
+    // nothing found
     return res.json({
       slug, date, resourceId,
-      startTime: startHH,
-      endTime: endHH,
-      price: chosen ? chosen.price : '? EUR',
-      source: chosen ? 'popup_row' : 'popup',
+      startTime: startHH, endTime: endHH,
+      price: '? EUR',
+      source: 'popup_not_found',
       debug
     });
 
@@ -672,9 +706,178 @@ app.get('/price', async (req, res) => {
   }
 });
 
+
+
 /* =========================
    Helpers (single, de-duplicated)
    ========================= */
+
+// Robust popup finder that works for tooltip OR modal variants
+async function findBookingPopup(page, { courtName, startHH }, timeoutMs = 4500) {
+  const deadline = Date.now() + timeoutMs;
+
+  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
+  const toHMM = s => {
+    const m = /(\d{1,2}):(\d{2})/.exec(String(s||'')); 
+    return m ? `${parseInt(m[1],10)}:${m[2]}` : null; // strip leading zero in hours
+  };
+  const wantName = courtName ? norm(courtName) : null;
+  const wantTime = toHMM(startHH);
+
+  // cover both tooltip & dialog-style containers
+  const containerSel = [
+    '[role="dialog"]',
+    '[aria-modal="true"]',
+    '[role="tooltip"]',
+    'div[style*="position: fixed"]',
+    'div[style*="position: absolute"]',
+    'div.fixed',
+    'div.absolute',
+    '[data-state="open"]',
+    'div[class*="z-50"]'
+  ].join(', ');
+
+  while (Date.now() < deadline) {
+    const pops = page.locator(containerSel);
+    const n = await pops.count().catch(() => 0);
+
+    for (let i = 0; i < n; i++) {
+      const p = pops.nth(i);
+
+      // Must be visible and reasonably sized
+      try {
+        const bb = await p.boundingBox().catch(() => null);
+        if (!bb || bb.width < 160 || bb.height < 80) continue;
+      } catch { continue; }
+
+      // If we can find a header row, confirm time/name there
+      let header = p.locator('.flex.flex-row.justify-between.font-bold').first();
+      if (!(await header.count())) {
+        header = p.locator('div').filter({
+          has: page.locator(':scope > div:nth-child(2)', { hasText: /\b\d{1,2}:\d{2}\b/ })
+        }).first();
+      }
+      if (await header.count()) {
+        const kids = header.locator(':scope > div');
+        const leftName  = ((await kids.nth(0).innerText().catch(()=>'')) || '').toString();
+        const rightTime = ((await kids.nth(1).innerText().catch(()=>'')) || '').toString();
+
+        const nameOk = !wantName || norm(leftName).includes(wantName) || wantName.includes(norm(leftName));
+        const timeOk = !wantTime || toHMM(rightTime) === wantTime;
+
+        if (nameOk && timeOk) return p;
+      }
+
+      // Otherwise, accept containers that clearly contain duration+price rows
+      const innerText = (await p.innerText().catch(()=>'')) || '';
+      const hasMoney  = /(EUR|€|\$|USD|GBP|£|kr)/i.test(innerText);
+      const hasDur    = /(\d+\s*h\s*\d{0,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(innerText);
+      const hasTime   = wantTime ? new RegExp(`\\b${wantTime}\\b`).test(innerText) : true;
+      const hasName   = wantName ? norm(innerText).includes(wantName) : true;
+
+      if (hasMoney && hasDur && hasTime && hasName) return p;
+    }
+
+    await page.waitForTimeout(120);
+  }
+  return null;
+}
+
+// Extract rows like ["1h 30m","54 EUR"] from a tooltip/modal container Locator
+async function readRowsFromTooltip(tip) {
+  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+  const rows = [];
+
+  // Prefer the obvious row selector first, fallback to scanning all divs
+  const candidates = await tip.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
+  const scan = candidates.length ? candidates : await tip.locator('div').all().catch(()=>[]);
+
+  for (const r of scan) {
+    const kids = r.locator(':scope > div');
+    if ((await kids.count().catch(()=>0)) !== 2) continue;
+
+    const left  = norm(await kids.nth(0).innerText().catch(()=>'')); // "2h 00m"
+    const right = norm(await kids.nth(1).innerText().catch(()=>'')); // "72 EUR"
+
+    const looksDur   = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
+    const looksMoney = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
+    if (!looksDur || !looksMoney) continue;
+
+    // parse minutes from "Xh YYm" | "Xh" | "YYm"
+    let minutes = null, m;
+    const s = left.toLowerCase();
+    if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) minutes = (+m[1])*60 + (+m[2]);
+    else if ((m = s.match(/(\d+)\s*h(?![a-z])/)))  minutes = (+m[1])*60;
+    else if ((m = s.match(/(\d{1,3})\s*m/)))       minutes = (+m[1]);
+
+    if (minutes) rows.push({ label: left, minutes, price: right });
+  }
+  return rows;
+}
+
+// Fallback: hit the same availability JSON the page uses, and match start/duration
+async function priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, durationMin) {
+  try {
+    const result = await page.evaluate(async ({ date, resourceId, startHH, endHH, durationMin }) => {
+      const hhmmss = (hhmm) => /\d{2}:\d{2}/.test(hhmm) ? `${hhmm}:00` : hhmm;
+      const wantStart = hhmmss(startHH);
+
+      const toMin = (s) => { const [H,M]=s.split(':').map(Number); return (H|0)*60 + (M|0); };
+      const wantDur = (durationMin|0) || (endHH ? ((toMin(endHH)-toMin(startHH)+1440)%1440) : 0);
+
+      const el = document.querySelector('script#__NEXT_DATA__');
+      const data = el ? JSON.parse(el.textContent || '{}') : null;
+
+      const findUuid = (n) => {
+        if (!n || typeof n !== 'object') return null;
+        if (typeof n.id === 'string' &&
+            /^[0-9a-f-]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(n.id)) return n.id;
+        for (const v of Object.values(n)) { const got = findUuid(v); if (got) return got; }
+        return null;
+      };
+
+      const clubId = findUuid(data);
+      if (!clubId) return null;
+
+      const url = `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&date=${encodeURIComponent(date)}`;
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      if (!resp.ok) return null;
+      const arr = await resp.json();
+
+      for (const row of Array.isArray(arr) ? arr : []) {
+        if (String(row.resource_id) !== String(resourceId)) continue;
+        for (const sl of row.slots || []) {
+          const st = String(sl.start_time || '');
+          const dur = (sl.duration|0);
+          if (!st.startsWith(wantStart)) continue;
+          if (wantDur && dur !== wantDur) continue;
+          const price = String(sl.price || '').trim();
+          if (price) return price;
+        }
+      }
+      return null;
+    }, { date, resourceId, startHH, endHH, durationMin });
+    return result || null;
+  } catch { return null; }
+}
+
+// Fallback: read "Continue – XX EUR" button text if visible
+async function readContinuePrice(page, timeoutMs = 2000) {
+  const start = Date.now();
+  const moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR|\$|USD|£|GBP|kr)\b/i;
+
+  while (Date.now() - start < timeoutMs) {
+    const btn = page.getByRole('button', { name: /continue/i }).first();
+    if (await btn.count()) {
+      const txt = (await btn.textContent()) || '';
+      const m = txt.match(moneyRe);
+      if (m) return m[0].replace(/\s+/g, ' ').trim();
+    }
+    await page.waitForTimeout(150);
+  }
+  return null;
+}
+
 
 // Find the scroll grid row label (court name) for a given resource
 async function getCourtNameForResource(page, rid) {
@@ -1084,3 +1287,4 @@ async function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
