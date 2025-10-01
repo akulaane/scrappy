@@ -956,33 +956,7 @@ async function findTooltipByHeader(page, expectName, expectStart, timeoutMs = 45
   return null;
 }
 
-//debiil
 
-const tip = await findTooltipByHeader(page, debug.courtName, startHH, Math.max(800, deadline - Date.now()));
-if (!tip) {
-  const dump = await page.evaluate(() => {
-    const sels = ['[role="dialog"]','[aria-modal="true"]','[role="tooltip"]','div.fixed','div.absolute','[data-state="open"]'];
-    const seen = new Set();
-    const out = [];
-    const norm = s => String(s||'').replace(/\s+/g,' ').trim();
-    for (const sel of sels) {
-      document.querySelectorAll(sel).forEach(el => {
-        if (seen.has(el)) return;
-        seen.add(el);
-        const r = el.getBoundingClientRect();
-        const header = el.querySelector('.flex.flex-row.justify-between.font-bold');
-        out.push({
-          sel,
-          w: Math.round(r.width), h: Math.round(r.height),
-          header: header ? norm(header.textContent).slice(0,180) : null,
-          text: norm(el.innerText || '').slice(0,220)
-        });
-      });
-    }
-    return out;
-  });
-  console.log('POPUP_CANDIDATES', dump);
-}
 
 // Extract rows like ["1h 30m","54 EUR"] from a tooltip container Locator
 async function readRowsFromTooltip(tip) {
@@ -1326,5 +1300,6 @@ async function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
 
 
