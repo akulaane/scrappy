@@ -790,7 +790,39 @@ async function findBookingPopup(page, { courtName, startHH }, timeoutMs = 4500) 
 
     await page.waitForTimeout(120);
   }
-  return null;
+   // No match — dump candidates for diagnosis
+try {
+  const dump = await page.evaluate(() => {
+    const sels = [
+      '[role="dialog"]','[aria-modal="true"]','[role="tooltip"]',
+      'div.fixed','div.absolute','[data-state="open"]','div[class*="z-"]'
+    ];
+    const seen = new Set(), out = [];
+    const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+
+    for (const sel of sels) {
+      document.querySelectorAll(sel).forEach(el => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        const r = el.getBoundingClientRect();
+        const header = el.querySelector('.flex.flex-row.justify-between.font-bold');
+        out.push({
+          sel,
+          w: Math.round(r.width), h: Math.round(r.height),
+          vis: !!(r.width && r.height && r.bottom > 0 && r.right > 0),
+          z: getComputedStyle(el).zIndex,
+          header: header ? norm(header.textContent).slice(0,180) : null,
+          txt: norm(el.innerText || '').slice(0,240)
+        });
+      });
+    }
+    return out;
+  });
+  console.log('POPUP_CANDIDATES', dump);
+} catch (e) {
+  console.log('POPUP_CANDIDATES_ERROR', String(e));
+}
+return null;
 }
 
 // Extract rows like ["1h 30m","54 EUR"] from a tooltip/modal container Locator
@@ -1000,6 +1032,44 @@ async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 24
   }
   const wantStart = toHMM(startHH);
   const wantEnd   = toHMM(endHH);
+
+
+   // --- Playwright-level click first (preferred) ---
+async function tryMouseClickOnce() {
+  // Accept both "H:MM" and "HH:MM"
+  const hhVariants = (hhmm) => {
+    const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return [String(hhmm || '')];
+    const H = parseInt(m[1], 10), M = m[2];
+    return [`${H}:${M}`, `${String(H).padStart(2,'0')}:${M}`];
+  };
+
+  const starts = hhVariants(startHH);
+  const ends   = endHH ? hhVariants(endHH) : [null];
+
+  for (const s of starts) {
+    for (const e of ends) {
+      let base = page.locator(`div[data-court-id="${resourceId}"][data-start-hour="${s}"]`);
+      if (e) base = base.filter({ has: page.locator(`[data-end-hour="${e}"]`) });
+      if (await base.count()) {
+        const abs = base.locator('xpath=.//div[contains(@class,"absolute")]').first();
+        const target = (await abs.count()) ? abs : base.first();
+
+        const box = await target.boundingBox().catch(() => null);
+        if (box) {
+          await page.mouse.move(box.x + box.width/2, box.y + Math.min(box.height/2, 8));
+          await page.mouse.click(box.x + box.width/2, box.y + Math.min(box.height/2, 8), { delay: 20 });
+          return { ok: true };
+        } else {
+          // no bbox (possibly offscreen); try force-click the locator
+          try { await target.click({ force: true }); return { ok: true }; } catch {}
+        }
+      }
+    }
+  }
+  return { ok: false };
+}
+
 
   async function tryClickOnce() {
     return await page.evaluate(({ rid, s, e }) => {
@@ -1300,6 +1370,7 @@ async function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
 
 
 
