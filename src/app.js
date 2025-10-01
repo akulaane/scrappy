@@ -441,7 +441,7 @@ perClubItems.push({
   slotDate: date,
   courtName: cm.courtName || null,
   startTime: startHH,
-  endTime: useEndHH,
+  endTime: EndHH,
   price: lookedUp || '? EUR',   // show “? EUR” when no JSON price
   priceRaw: lookedUp || null,   // keep raw for debugging/optional display
   priceSource,                  // 'availability' or 'dom_only'
@@ -541,165 +541,113 @@ perClubItems.push({
 /* =========================
    Single-slot price verifier
    ========================= */
+
 // GET /price
 // Params:
-//   slug       = club slug (required)
-//   date       = YYYY-MM-DD (required)
-//   resourceId = court/resource uuid (required)
-//   start      = "HH:MM" (required)  -> START time, local
-//   end        = "HH:MM" (preferred)  OR
-//   duration   = 60|90|120 (fallback if end not provided)
-
+//   slug        = club slug (e.g. "padelikeskus")   [required]
+//   date        = YYYY-MM-DD                        [required]
+//   resourceId  = court resource UUID               [required]
+//   start       = "HH:MM"                           [required]
+//   end         = "HH:MM"                           [preferred]
+//   duration    = 60|90|120                         [fallback if end not provided]
 app.get('/price', async (req, res) => {
   const BASE = 'https://playtomic.com';
 
   const slug       = String(req.query.slug || '').trim();
   const date       = String(req.query.date || '').trim();
-const resourceId = String(req.query.resourceId || '').trim();
-const startHH    = normHHMM(String(req.query.start || ''));
-let endHH        = normHHMM(String(req.query.end || ''));
-let duration     = parseInt(req.query.duration || '0', 10) || 0;
+  const resourceId = String(req.query.resourceId || '').trim();
+  const startHH    = normHHMM(String(req.query.start || ''));
+  let   endHH      = normHHMM(String(req.query.end   || ''));
+  let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
-if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
-  return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
-}
+  // local helpers
+  const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
+  const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
 
-// derive the missing one if only one of (endHH, duration) is provided
-if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
-if (!duration && endHH) duration = ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
+  if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
+    return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
+  }
 
-// require at least one of them to be valid
-if (!endHH && !duration) {
-  return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
-}
+  // derive the missing one if only one of (endHH, duration) is provided
+  if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
+  if (!duration && endHH) duration = ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
 
+  if (!endHH && !duration) {
+    return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
+  }
 
   let context, page;
   const debug = {
+    slug, date, resourceId, startHH, endHH, duration,
     url: `${BASE}/clubs/${encodeURIComponent(slug)}`,
     steps: [],
-    clicked: false,
-    endHH: null,
-    priceSourcesTried: [],
-    clubTitleRaw: null,
-    clubName: null,
+    clicked: null,
     domPrice: null,
-    netPrice: null,
     jsonPrice: null,
-    error: null,
+    source: null
   };
 
   try {
     context = await newContext();
     page = await context.newPage();
 
-    // speed tweaks: block images/fonts/trackers
+    // trim trackers for speed
     await page.route('**/*', (route) => {
       const u = route.request().url();
-      if (/\.(png|jpe?g|gif|webp|svg|ico|bmp|woff2?|ttf)$/i.test(u)) return route.abort();
-      if (u.includes('google-analytics') || u.includes('googletagmanager') ||
-          u.includes('doubleclick')      || u.includes('hotjar') ||
-          u.includes('facebook.net')     || u.includes('segment.com')) return route.abort();
+      if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
+          u.includes('doubleclick.net') || u.includes('hotjar') ||
+          u.includes('facebook.net')   || u.includes('segment.com')) {
+        return route.abort();
+      }
       route.continue();
     });
 
+    // nav + hydrate
     await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector('#__next', { timeout: 30000 }).catch(() => {});
-    await autoDismissConsent(page).catch(()=>{});
+    await autoDismissConsent(page).catch(() => {});
     await page.evaluate(() => window.scrollTo(0, 0)).catch(()=>{});
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
-    // Clean club name from title (optional)
-    const rawTitle = await page.title().catch(() => '') || '';
-    debug.clubTitleRaw = rawTitle;
-    debug.clubName = rawTitle
-      .replace(/^Book a court\s+(?:at|in)\s+/i, '')
-      .replace(/\s*\|\s*Playtomic\s*$/i, '')
-      .trim() || null;
-
-    // Drive to the requested date
-    const cal = await forceDateInUI(page, date);
+    // pick date in UI so the correct grid is shown
+    await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // Click the requested slot
-const { clicked, endHH: clickedEnd } = await findAndClickSlot(page, resourceId, startHH, endHH);
-const useEndHH = clickedEnd || endHH; // keep what we intended/clicked
+    // click the slot
+    const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
+    debug.clicked = clickRes.clicked;
 
-    debug.clicked = clicked;
-    debug.endHH = endHH;
-
-    // If we failed to click, still try JSON fallback (maybe UI shape changed)
-    if (!clicked) {
-      debug.priceSourcesTried.push('calendar_json');
-const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration);
-
-      debug.jsonPrice = jsonPrice;
-      const price = jsonPrice || null;
-      return res.json({
-        ok: !!price,
-        item: {
-          slug,
-          clubName: debug.clubName || slug,
-          resourceId,
-          slotDate: date,
+    if (debug.clicked) {
+      // bounded wait for a visible price in modal/sidebar — no infinite loop
+      debug.domPrice = await readPriceFromDOM(page, 4500);
+      if (debug.domPrice) {
+        debug.source = 'dom';
+        return res.json({
+          slug, date, resourceId,
           startTime: startHH,
-          endTime: endHH,
-          price: price || '? EUR',
-        },
-        source: price ? 'calendar_json' : 'unknown',
-        debug
-      });
-    }
-
-    // After click, try to capture price via network
-    debug.priceSourcesTried.push('click_network');
-    const netPrice = await waitForPriceFromNetwork(page, 3500);
-    debug.netPrice = netPrice;
-
-    // If no network price, try DOM
-    let finalPrice = netPrice;
-    let source = 'click_network';
-    if (!finalPrice) {
-      debug.priceSourcesTried.push('click_dom');
-      const domPrice = await readPriceFromDom(page);
-      debug.domPrice = domPrice;
-      if (domPrice) {
-        finalPrice = domPrice;
-        source = 'click_dom';
+          endTime: endHH || minToHHMM(hmToMin(startHH) + duration),
+          price: debug.domPrice,
+          source: 'dom',
+          debug
+        });
       }
     }
 
-    // If still nothing, fallback to availability JSON
-    if (!finalPrice) {
-      debug.priceSourcesTried.push('calendar_json');
-const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, useEndHH, duration);
-
-      debug.jsonPrice = jsonPrice;
-      if (jsonPrice) {
-        finalPrice = jsonPrice;
-        source = 'calendar_json';
-      }
-    }
+    // DOM failed or slot not clickable — fall back to availability JSON (single fetch)
+    debug.jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration);
+    debug.source = debug.jsonPrice ? 'json' : 'unknown';
 
     return res.json({
-      ok: !!finalPrice,
-      item: {
-        slug,
-        clubName: debug.clubName || slug,
-        resourceId,
-        slotDate: date,
-        startTime: startHH,
-        endTime: useEndHH,
-        price: finalPrice || '? EUR',
-      },
-      source,
+      slug, date, resourceId,
+      startTime: startHH,
+      endTime: endHH || minToHHMM(hmToMin(startHH) + duration),
+      price: debug.jsonPrice || '? EUR',
+      source: debug.source,
       debug
     });
-
   } catch (e) {
-    debug.error = String(e);
-    return res.status(500).json({ ok: false, error: 'price lookup failed', debug });
+    return res.status(500).json({ error: 'price failed', detail: String(e), debug });
   } finally {
     try { await page?.close(); } catch {}
     try { await context?.close(); } catch {}
@@ -715,7 +663,31 @@ const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startH
 // Returns {clicked: boolean, endHH: string|null}
 // Click the specific slot for a resource + start + (optional) end.
 // If endHH provided, prefer exact start+end; otherwise click any block with that start.
+// Click the specific slot for (resourceId, startHH, endHH?)
+// If endHH provided, prefer exact match; otherwise click any with that start.
+
+// Read a visible price like "56 EUR" or "56 €" within timeoutMs (no infinite waits)
+async function readPriceFromDOM(page, timeoutMs = 4500) {
+  const start = Date.now();
+  const re = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      // grab any node containing a money-looking token
+      const loc = page.locator('text=/\\b\\d+(?:[.,]\\d{1,2})?\\s*(?:€|EUR)\\b/i').first();
+      if (await loc.count()) {
+        const txt = (await loc.textContent()) || '';
+        const m = txt.match(re);
+        if (m) return m[0].replace(/\s+/g, ' ').trim();
+      }
+    } catch {}
+    await page.waitForTimeout(200);
+  }
+  return null;
+}
+
 async function findAndClickSlot(page, resourceId, startHH, endHH) {
+  // make sure the grid rendered
   await sweepVirtualizedGrid(page).catch(()=>{});
 
   const exactSel = endHH
@@ -739,6 +711,7 @@ async function findAndClickSlot(page, resourceId, startHH, endHH) {
   await target.click({ force: true, delay: 20 }).catch(()=>{});
   return { clicked: true, endHH: endHH || null };
 }
+
 
 
 // Try to read a price from network responses that fire after clicking.
@@ -1221,5 +1194,6 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
