@@ -567,80 +567,81 @@ app.get('/price', async (req, res) => {
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
-
-  // derive the missing piece
   if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
   if (!duration && endHH) duration = ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
 
-  // Robust popup reader: ignore classes, rely on text structure.
-  async function readPopupDurations(page, startHH, courtNameOpt, timeoutMs = 6500) {
-    // wait a bit for popup to mount
-    try { await page.waitForTimeout(120); } catch {}
+  // Robust popup reader: look for the container that holds a "Continue" button,
+  // then scrape the two-column duration rows inside that same container.
+  async function readPopupDurations(page, startHH, courtNameOpt, timeoutMs = 7000) {
+    const norm = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
 
-    // Try repeatedly for up to timeoutMs
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      const data = await page.evaluate(({ startHH, courtNameOpt }) => {
-        const out = { header: null, rows: [] };
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      // usually there is exactly one – we take the last just in case
+      const popup = page.locator('div:has(> button:has-text("Continue"))').last();
+      const count = await popup.count().catch(() => 0);
 
-        // The last popup in DOM that contains the startHH and at least one "h mm" row
-        const candidates = Array.from(document.querySelectorAll('div'))
-          .filter(el => {
-            const t = (el.textContent || '').trim();
-            if (!t || !t.includes(startHH)) return false;
-            return /\b\d+\s*h\s*\d{2}\s*m\b/i.test(t); // must contain duration-like text
+      if (count) {
+        // ensure it really mounted
+        await popup.waitFor({ state: 'visible', timeout: 1500 }).catch(() => {});
+        // small settle
+        await page.waitForTimeout(120).catch(()=>{});
+
+        const txt = norm(await popup.innerText().catch(() => ''));
+        const hasStart = txt.includes(startHH);
+        const hasAnyRowHint = /\b\d+\s*h\s*\d{1,2}\s*m\b/i.test(txt) || /\b\d{2,3}\s*m\b/i.test(txt) || /\b\d+\s*h\b/i.test(txt);
+
+        if (hasStart && hasAnyRowHint) {
+          // Extract rows: any element with exactly two direct DIV children → [label, price]
+          const rows = await popup.evaluate(() => {
+            const norm = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+            const out = [];
+            const all = Array.from(document.querySelectorAll('div'));
+            for (const el of all) {
+              if (!el.isConnected) continue;
+              // only consider descendants of the *latest* popup (heuristic):
+              // use the nearest ancestor that also contains a "Continue" button.
+              const hasContinueAncestor = !!el.closest('div:has(> button:has-text("Continue"))');
+              if (!hasContinueAncestor) continue;
+
+              const kids = el.querySelectorAll(':scope > div');
+              if (kids.length !== 2) continue;
+
+              const left  = norm(kids[0].textContent || '');
+              const right = norm(kids[1].textContent || '');
+
+              // left should be a duration-ish label; right must look like a price
+              const looksLikeDuration = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
+              const looksLikeMoney    = (/\b\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
+              if (looksLikeDuration && looksLikeMoney) out.push([left, right]);
+            }
+            return out;
           });
 
-        if (!candidates.length) return out;
-
-        const box = candidates[candidates.length - 1]; // newest / topmost
-
-        // Try to infer header (court name + time in two sibling divs)
-        // pattern: <div><div>[Court]</div><div>[HH:MM]</div></div>
-        const blocks = Array.from(box.querySelectorAll('div'));
-        for (const b of blocks) {
-          const a = b.querySelector(':scope > div:nth-child(1)');
-          const c = b.querySelector(':scope > div:nth-child(2)');
-          if (a && c && c.textContent && c.textContent.trim() === startHH) {
-            out.header = (a.textContent || '').trim();
-            break;
+          if (rows && rows.length) {
+            // Optionally filter by court name if header is available (best-effort)
+            // We avoid strict header parsing – rows are enough.
+            return { ok: true, rows };
           }
-        }
-
-        // Collect duration rows inside this box.
-        // Each row typically has two direct div children: "1h 30m" | "36 EUR"
-        const rows = [];
-        blocks.forEach(d => {
-          const kids = d.querySelectorAll(':scope > div');
-          if (kids.length === 2) {
-            const left  = (kids[0].textContent || '').trim();
-            const right = (kids[1].textContent || '').trim();
-            if (/^\d+\s*h\s*\d{2}\s*m$/i.test(left) && /\d/.test(right)) {
-              rows.push([left, right]);
-            }
-          }
-        });
-
-        out.rows = rows;
-        return out;
-      }, { startHH, courtNameOpt });
-
-      if (data?.rows?.length) {
-        // Optionally filter by court name if provided and header present
-        if (courtNameOpt && data.header && !data.header.includes(courtNameOpt)) {
-          // header exists but doesn't match — keep trying briefly
-        } else {
-          return { ok: true, header: data.header || null, rows: data.rows };
         }
       }
 
       await page.waitForTimeout(160);
     }
-    return { ok: false, header: null, rows: [] };
+    return { ok: false, rows: [] };
   }
+
+  const toMin = (label) => {
+    const s = String(label || '').replace(/\u00a0/g, ' ').toLowerCase().trim();
+    let m;
+    if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) return (+m[1])*60 + (+m[2]);
+    if ((m = s.match(/(\d+)\s*h(?![a-z])/)))        return (+m[1])*60;
+    if ((m = s.match(/(\d{1,3})\s*m/)))             return (+m[1]);
+    return null;
+  };
 
   let context, page;
   const debug = {
@@ -681,11 +682,11 @@ app.get('/price', async (req, res) => {
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // court name (helps target the right popup; we won't hard-require it)
+    // court name (best-effort, not mandatory)
     const meta = await collectCourtMeta(page);
     debug.courtName = meta.courts?.[resourceId]?.courtName || null;
 
-    // click the slot (now tolerant of unpadded H:MM times)
+    // click the slot (tolerant of unpadded times)
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = !!(clickRes && clickRes.clicked);
     debug.steps.push(`clicked_${debug.clicked ? 'ok' : 'fail'}`);
@@ -701,10 +702,11 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // read durations directly from the visible popup (no button text dependency)
-    const pop = await readPopupDurations(page, startHH, debug.courtName, 6500);
+    // small settle and try to read the popup
+    await page.waitForTimeout(150).catch(()=>{});
+    const pop = await readPopupDurations(page, startHH, debug.courtName, 7000);
     if (!pop.ok) {
-      debug.popupWhy = 'header_or_rows_not_found';
+      debug.popupWhy = 'rows_not_found';
       return res.json({
         slug, date, resourceId,
         startTime: startHH,
@@ -714,18 +716,14 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // map "1h 30m" → minutes, then pick requested duration
-    const toMin = (label) => {
-      const m = label.match(/(\d+)\s*h\s*(\d{2})\s*m/i);
-      if (!m) return null;
-      return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-    };
+    // build duration→price map and pick requested duration
     const priceMap = new Map();
     for (const [lbl, val] of pop.rows) {
       const mins = toMin(lbl);
       if (mins != null && !priceMap.has(mins)) priceMap.set(mins, val);
     }
-    debug.popupDurations = Array.from(priceMap.keys());
+    debug.popupDurations = Array.from(priceMap.keys()).sort((a,b)=>a-b);
+
     const chosen = priceMap.get(duration) || null;
     debug.price = chosen;
 
@@ -743,7 +741,6 @@ app.get('/price', async (req, res) => {
     try { await context?.close(); } catch {}
   }
 });
-
 
 
 /* =========================
@@ -1529,6 +1526,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
