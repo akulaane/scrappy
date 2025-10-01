@@ -617,36 +617,52 @@ app.get('/price', async (req, res) => {
   }
 
   async function clickExactBlock(page, rid, start, end, sweeps = 30) {
-    // try in current viewport first
-    let loc = await queryBlockLocator(page, rid, start, end);
+  async function clickAtLeft(locator) {
+    try { await locator.scrollIntoViewIfNeeded(); } catch {}
+    // Click ~15% from the left edge, mid-height — this anchors the START time.
+    const box = await locator.boundingBox().catch(() => null);
+    if (box) {
+      const x = box.x + Math.max(2, Math.floor(box.width * 0.15));
+      const y = box.y + Math.max(2, Math.floor(box.height * 0.5));
+      await page.mouse.click(x, y, { delay: 20 });
+    } else {
+      // Fallback if no box: relative click inside the element
+      await locator.click({ force: true, position: { x: 6, y: 12 } }).catch(() => {});
+    }
+    // tiny settle
+    await page.waitForTimeout(120);
+  }
+
+  // try in current viewport first
+  let loc = await queryBlockLocator(page, rid, start, end);
+  if (loc && await loc.count()) {
+    await clickAtLeft(loc);
+    return true;
+  }
+
+  // sweep down the grid to trigger virtualization rendering
+  for (let i = 0; i < sweeps; i++) {
+    const sc = await getGridScroller(page);
+    const moved = await page.evaluate(sc => {
+      const before = sc ? sc.scrollTop : window.scrollY;
+      const delta = Math.floor((sc ? sc.clientHeight : window.innerHeight) * 0.9);
+      if (sc) sc.scrollTop = Math.min(sc.scrollHeight, before + delta);
+      else window.scrollTo(0, before + delta);
+      return (sc ? sc.scrollTop : window.scrollY) !== before;
+    }, sc).catch(() => false);
+    try { await sc?.dispose(); } catch {}
+    await page.waitForTimeout(120);
+
+    loc = await queryBlockLocator(page, rid, start, end);
     if (loc && await loc.count()) {
-      try { await loc.scrollIntoViewIfNeeded(); } catch {}
-      await loc.click({ force: true }).catch(()=>{});
+      await clickAtLeft(loc);
       return true;
     }
-    // sweep down the grid to trigger virtualization rendering
-    for (let i = 0; i < sweeps; i++) {
-      const sc = await getGridScroller(page);
-      const moved = await page.evaluate(sc => {
-        const before = sc ? sc.scrollTop : window.scrollY;
-        const delta = Math.floor((sc ? sc.clientHeight : window.innerHeight) * 0.9);
-        if (sc) sc.scrollTop = Math.min(sc.scrollHeight, before + delta);
-        else window.scrollTo(0, before + delta);
-        return (sc ? sc.scrollTop : window.scrollY) !== before;
-      }, sc).catch(() => false);
-      try { await sc?.dispose(); } catch {}
-      await page.waitForTimeout(120);
-
-      loc = await queryBlockLocator(page, rid, start, end);
-      if (loc && await loc.count()) {
-        try { await loc.scrollIntoViewIfNeeded(); } catch {}
-        await loc.click({ force: true }).catch(()=>{});
-        return true;
-      }
-      if (!moved) break; // reached end
-    }
-    return false;
+    if (!moved) break; // reached end
   }
+  return false;
+}
+
 
   async function waitForTooltip(page, timeoutMs = 4000) {
     const t0 = Date.now();
@@ -801,6 +817,41 @@ app.get('/price', async (req, res) => {
 
     // NEW: read header (court name + start time) from the popup and log it
     const header = await readPopupHeader(tip);
+
+     // If the popup shows a different START (e.g., +1h), retry with a harder left-edge click once.
+if (header?.time && header.time !== startHH) {
+  try {
+    // Close current popup
+    await page.keyboard.press('Escape').catch(()=>{});
+    await page.mouse.click(10, 10).catch(()=>{});
+    await page.waitForTimeout(120);
+
+    // Re-find the exact block and click again at the left edge
+    const loc = await queryBlockLocator(page, resourceId, startHH, endHH);
+    if (loc && await loc.count()) {
+      // do a precise left-edge click
+      const box = await loc.boundingBox().catch(() => null);
+      if (box) {
+        const x = box.x + Math.max(2, Math.floor(box.width * 0.12));
+        const y = box.y + Math.max(2, Math.floor(box.height * 0.5));
+        await page.mouse.click(x, y, { delay: 20 });
+      } else {
+        await loc.click({ force: true, position: { x: 6, y: 12 } }).catch(()=>{});
+      }
+      await page.waitForTimeout(150);
+
+      // Re-grab tooltip + header
+      const tip2 = await waitForTooltip(page, 3000);
+      const header2 = tip2 ? await readPopupHeader(tip2) : null;
+      if (header2) {
+        debug.popupHeaderName = header2.name || debug.popupHeaderName;
+        debug.popupHeaderTime = header2.time || debug.popupHeaderTime;
+      }
+    }
+  } catch {}
+}
+
+     
     debug.popupHeaderName = header?.name || null;
     debug.popupHeaderTime = header?.time || null;
     console.log('[PRICE_POPUP_HEADER]', {
@@ -1234,4 +1285,5 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
