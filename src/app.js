@@ -1,3 +1,4 @@
+
 // app.js
 const express = require('express');
 const { chromium } = require('playwright');
@@ -16,9 +17,9 @@ const CHROME_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
-  // '--disable-gpu',
-  // '--single-process',
-  // '--no-zygote',
+  //'--disable-gpu',
+  //'--single-process',
+  //'--no-zygote',
 ];
 
 let BROWSER = null;
@@ -27,11 +28,10 @@ async function getBrowser() {
   BROWSER = await chromium.launch({ headless: true, args: CHROME_ARGS });
   return BROWSER;
 }
-
 async function newContext() {
   const browser = await getBrowser();
 
-  // 1) Create context (options only)
+  // 1) Create context (only the options object goes here)
   const context = await browser.newContext({
     viewport: { width: 1366, height: 900 },
     deviceScaleFactor: 1,
@@ -47,7 +47,7 @@ async function newContext() {
     },
   });
 
-  // 2) Speed up: block heavy/trackers
+  // 2) Speed up: block images, fonts, trackers (note: this is OUTSIDE the options object)
   await context.route('**/*', (route) => {
     const url = route.request().url();
     if (/\.(png|jpe?g|gif|webp|svg|ico|bmp|woff2?|ttf)$/i.test(url)) return route.abort();
@@ -85,6 +85,7 @@ async function newContext() {
   return context;
 }
 
+
 /* =========================
    Express views / demo
    ========================= */
@@ -110,16 +111,18 @@ app.post('/', async (req, res) => {
     context = await newContext();
     page = await context.newPage();
 
-    // Per-page additional blocking (cheap)
-    await page.route('**/*', route => {
-      const r = route.request();
-      const t = r.resourceType();
-      const u = r.url();
-      if (t === 'image' || t === 'media' || t === 'font' || u.includes('google-analytics')) {
-        return route.abort();
-      }
-      route.continue();
-    });
+   // Block images/media/fonts/analytics to speed up
+   await page.route('**/*', route => {
+   const req = route.request();
+   const t = req.resourceType();
+  const u = req.url();
+  if (t === 'image' || t === 'media' || t === 'font' || u.includes('google-analytics')) {
+    return route.abort();
+  }
+  route.continue();
+});
+
+     
 
     await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
 
@@ -172,10 +175,6 @@ function normHHMM(s) {
   const M = String(parseInt(m[2], 10)).padStart(2, '0');
   return `${H}:${M}`;
 }
-// Convert "HH:MM" <-> minutes since midnight
-function hmToMin(s) { const [h,m] = String(s||'').split(':').map(Number); return (h|0)*60 + (m|0); }
-function minToHHMM(min) { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; }
-
 function addDaysYMD(ymd, n) {
   const d = new Date(`${ymd}T00:00:00`);
   if (Number.isNaN(d.getTime())) return ymd;
@@ -214,6 +213,7 @@ app.get('/availability', async (req, res) => {
   }
 
   // Start-time window filters
+  const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
   const earliestHH = normHHMM(String(req.query.earliest || ''));
   const latestHH   = normHHMM(String(req.query.latest   || ''));
   const earliestMin = earliestHH ? hmToMin(earliestHH) : null;
@@ -227,7 +227,7 @@ app.get('/availability', async (req, res) => {
     context = await newContext();
     page = await context.newPage();
 
-    // Trim trackers
+    // Trim some trackers to speed up a bit
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -260,127 +260,137 @@ app.get('/availability', async (req, res) => {
         await autoDismissConsent(page).catch(() => {});
         await page.evaluate(() => window.scrollTo(0, 0)).catch(()=>{});
         const hydrated = await ensureHydrated(page);
-        clubDebug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
-        // Club name from title (cleaned)
-        {
-          const rawTitle = await page.title().catch(() => '');
-          clubDebug.clubTitleRaw = rawTitle;
-          clubDebug.clubName = (rawTitle || '')
-            .replace(/^Book a court\s+(?:at|in)\s+/i, '')
-            .replace(/\s*\|\s*Playtomic\s*$/i, '')
-            .trim();
-        }
+// Club name from title (cleaned)
+{
+  const rawTitle = await page.title().catch(() => '');
+  clubDebug.clubTitleRaw = rawTitle;
+  clubDebug.clubName = (rawTitle || '')
+    .replace(/^Book a court\s+(?:at|in)\s+/i, '')
+    .replace(/\s*\|\s*Playtomic\s*$/i, '')
+    .trim();
+}
+
+
+
+         
+         
+        clubDebug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
         // Drive picker to date
         const cal = await forceDateInUI(page, date);
         clubDebug.steps.push('date_selected');
+
+        // Give layout a moment
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
 
-        // ---- PRICE CAPTURE: (1) live responses, (2) performance sniff, (3) in-page guesses ----
-        let priceIndex = new Map();
-        const availPayloads = [];
+// ---- PRICE CAPTURE: (1) live responses, (2) performance sniff, (3) in-page guesses ----
+let priceIndex = new Map();
+const availPayloads = [];
 
-        // (1) Listen briefly for live responses to /api/clubs/availability
-        const onAvail = async (r) => {
-          const u = r.url();
-          if (u.includes('/api/clubs/availability') && r.status() === 200) {
-            try {
-              const j = await r.json();
-              availPayloads.push(j);
-              (clubDebug.availUrls ||= []).push(u);
-            } catch {}
-          }
-        };
-        page.on('response', onAvail);
+// (1) Listen briefly for live responses to /api/clubs/availability
+const onAvail = async (r) => {
+  const u = r.url();
+  if (u.includes('/api/clubs/availability') && r.status() === 200) {
+    try {
+      const j = await r.json();
+      availPayloads.push(j);
+      (clubDebug.availUrls ||= []).push(u);
+    } catch {}
+  }
+};
+page.on('response', onAvail);
 
-        await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
-        page.off('response', onAvail);
-        clubDebug.priceIndexSize = priceIndex.size || 0;
+// short settle window for the picker to fire XHRs
+await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+page.off('response', onAvail);
+         clubDebug.priceIndexSize = priceIndex.size || 0;
 
-        // (2) Look at Performance entries to discover the exact URL the app used
+// (2) Look at Performance entries to discover the exact URL the app used
+try {
+  const perfUrls = await page.evaluate(() => {
+    const entries = performance.getEntriesByType('resource') || [];
+    return entries.map(e => e.name).filter(u => u.includes('/api/clubs/availability')).slice(-3);
+  });
+  if (perfUrls?.length) {
+    clubDebug.perfAvailUrls = perfUrls;
+    // Fetch the newest one again to get JSON
+    const lastUrl = perfUrls[perfUrls.length - 1];
+    const p = await page.evaluate(async (u) => {
+      const r = await fetch(u, { credentials: 'same-origin' });
+      if (!r.ok) return null;
+      try { return await r.json(); } catch { return null; }
+    }, lastUrl);
+    if (p) availPayloads.push(p);
+  }
+} catch {}
+
+// (3) If still nothing, try a few likely query variants using clubId from __NEXT_DATA__
+if (availPayloads.length === 0) {
+  try {
+    const guessed = await page.evaluate(async (theDate) => {
+      const tried = [];
+      const results = [];
+
+      const el = document.querySelector('script#__NEXT_DATA__');
+      const data = el ? JSON.parse(el.textContent || '{}') : null;
+
+      function findUuid(n) {
+        if (!n || typeof n !== 'object') return null;
+        if (typeof n.id === 'string' && /^[0-9a-f-]{36}$/i.test(n.id)) return n.id;
+        for (const v of Object.values(n)) { const got = findUuid(v); if (got) return got; }
+        return null;
+      }
+
+      const clubId = findUuid(data);
+      if (!clubId) return { tried, results };
+
+      const urls = [
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&start_date=${encodeURIComponent(theDate)}`,
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&start_date=${encodeURIComponent(theDate)}&days=2`,
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&date=${encodeURIComponent(theDate)}`,
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&startDate=${encodeURIComponent(theDate)}`,
+        `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&dateFrom=${encodeURIComponent(theDate)}`
+      ];
+
+      for (const u of urls) {
+        tried.push(u);
         try {
-          const perfUrls = await page.evaluate(() => {
-            const entries = performance.getEntriesByType('resource') || [];
-            return entries.map(e => e.name).filter(u => u.includes('/api/clubs/availability')).slice(-3);
-          });
-          if (perfUrls?.length) {
-            clubDebug.perfAvailUrls = perfUrls;
-            const lastUrl = perfUrls[perfUrls.length - 1];
-            const p = await page.evaluate(async (u) => {
-              const r = await fetch(u, { credentials: 'same-origin' });
-              if (!r.ok) return null;
-              try { return await r.json(); } catch { return null; }
-            }, lastUrl);
-            if (p) availPayloads.push(p);
+          const r = await fetch(u, { credentials: 'same-origin' });
+          if (r.ok) {
+            const j = await r.json();
+            if (j && (Array.isArray(j) ? j.length : Object.keys(j).length)) {
+              results.push({ url: u, payload: j });
+              break;
+            }
           }
         } catch {}
+      }
+      return { tried, results };
+    }, date);
 
-        // (3) If still nothing, try a few likely query variants using clubId from __NEXT_DATA__
-        if (availPayloads.length === 0) {
-          try {
-            const guessed = await page.evaluate(async (theDate) => {
-              const tried = [];
-              const results = [];
+    clubDebug.guessTried = guessed?.tried || [];
+    if (guessed?.results?.length) {
+      clubDebug.guessHit = guessed.results[0].url;
+      availPayloads.push(guessed.results[0].payload);
+    }
+  } catch {}
+}
 
-              const el = document.querySelector('script#__NEXT_DATA__');
-              const data = el ? JSON.parse(el.textContent || '{}') : null;
+// Finally build the index (prefer target date if present)
+for (const payload of availPayloads) {
+  const part = buildPriceIndex(payload, date);
+  for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
+}
+clubDebug.priceIndex = {
+  size: priceIndex.size,
+  sample: Array.from(priceIndex.keys()).slice(0, 5)
+};
 
-              function findUuid(n) {
-                if (!n || typeof n !== 'object') return null;
-                if (typeof n.id === 'string' && /^[0-9a-f-]{36}$/i.test(n.id)) return n.id;
-                for (const v of Object.values(n)) { const got = findUuid(v); if (got) return got; }
-                return null;
-              }
-
-              const clubId = findUuid(data);
-              if (!clubId) return { tried, results };
-
-              const urls = [
-                `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&start_date=${encodeURIComponent(theDate)}`,
-                `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&start_date=${encodeURIComponent(theDate)}&days=2`,
-                `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&date=${encodeURIComponent(theDate)}`,
-                `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&startDate=${encodeURIComponent(theDate)}`,
-                `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&dateFrom=${encodeURIComponent(theDate)}`
-              ];
-
-              for (const u of urls) {
-                tried.push(u);
-                try {
-                  const r = await fetch(u, { credentials: 'same-origin' });
-                  if (r.ok) {
-                    const j = await r.json();
-                    if (j && (Array.isArray(j) ? j.length : Object.keys(j).length)) {
-                      results.push({ url: u, payload: j });
-                      break;
-                    }
-                  }
-                } catch {}
-              }
-              return { tried, results };
-            }, date);
-
-            clubDebug.guessTried = guessed?.tried || [];
-            if (guessed?.results?.length) {
-              clubDebug.guessHit = guessed.results[0].url;
-              availPayloads.push(guessed.results[0].payload);
-            }
-          } catch {}
-        }
-
-        // Build the index (prefer target date if present)
-        for (const payload of availPayloads) {
-          const part = buildPriceIndex(payload, date);
-          for (const [k, v] of part) if (!priceIndex.has(k)) priceIndex.set(k, v);
-        }
-        clubDebug.priceIndex = {
-          size: priceIndex.size,
-          sample: Array.from(priceIndex.keys()).slice(0, 5)
-        };
 
         // Per-court meta (name/tags)
-        const meta = await collectCourtMeta(page);
-        clubDebug.clubName = meta.clubName || clubDebug.clubName || null;
+const meta = await collectCourtMeta(page);
+clubDebug.clubName = meta.clubName || clubDebug.clubName || null;
 
         // Visible/available blocks → source of truth
         const blocks = await page.$$eval(
@@ -409,39 +419,42 @@ app.get('/availability', async (req, res) => {
           if (earliestMin != null && st < earliestMin) continue;
           if (latestMin   != null && st > latestMin)   continue;
 
-          // price lookup (+ fallback for DOM-only slots)
-          const k1 = `${b.courtId}|${startHH}|${endHH}`;
-          const k2 = `${b.courtId}|${startHH}|`;
-          const lookedUp = priceIndex.get(k1) || priceIndex.get(k2) || null;
+// price lookup (+ fallback for DOM-only slots)
+const k1 = `${b.courtId}|${startHH}|${endHH}`;
+const k2 = `${b.courtId}|${startHH}|`;
+const lookedUp = priceIndex.get(k1) || priceIndex.get(k2) || null;
 
-          const cm = meta.courts[b.courtId] || {};
+const price       = lookedUp ?? null;
+const priceSource = lookedUp ? 'availability' : 'dom_only';
 
-          perClubItems.push({
-            slug,
-            clubName: meta.clubName || slug,
-            resourceId: b.courtId,
-            slotDate: date,
-            courtName: cm.courtName || null,
-            startTime: startHH,
-            endTime: endHH,
-            price: lookedUp || '? EUR',  // show “? EUR” when no JSON price
-            priceRaw: lookedUp || null,  // keep raw for debugging/optional display
-            priceSource: lookedUp ? 'availability' : 'dom_only',
-            hasPrice: !!lookedUp,
-            size: cm.size || null,
-            location: cm.location || null,
-          });
+const cm = meta.courts[b.courtId] || {};
+
+perClubItems.push({
+  slug,
+  clubName: meta.clubName || slug,
+  resourceId: b.courtId,
+  slotDate: date,
+  courtName: cm.courtName || null,
+  startTime: startHH,
+  endTime: endHH,
+  price: lookedUp || '? EUR',   // show “? EUR” when no JSON price
+  priceRaw: lookedUp || null,   // keep raw for debugging/optional display
+  priceSource,                  // 'availability' or 'dom_only'
+  hasPrice: !!lookedUp,         // quick boolean for UI
+  size: cm.size || null,
+  location: cm.location || null,
+});
+
+
         }
 
         clubDebug.filtered = perClubItems.length;
         clubDebug.status = 'ok';
 
-        // Optional screenshot
+        // Optional screenshot for debugging
         if (wantShot) {
           try {
-            clubDebug.screenshot = Buffer
-              .from(await page.screenshot({ fullPage: true }))
-              .toString('base64');
+            clubDebug.screenshot = Buffer.from(await page.screenshot({ fullPage: true })).toString('base64');
           } catch {}
         }
 
@@ -466,11 +479,12 @@ app.get('/availability', async (req, res) => {
     })();
 
     let verdict;
-    if (succeeded === 0) verdict = 'error';
-    else if (totalslots === 0) verdict = 'empty_ok';
-    else if (failed > 0) verdict = 'partial_ok';
-    else verdict = 'ok';
+    if (succeeded === 0) verdict = 'error';               // all queries failed
+    else if (totalslots === 0) verdict = 'empty_ok';      // queries ok, but no matches
+    else if (failed > 0) verdict = 'partial_ok';          // some clubs failed
+    else verdict = 'ok';                                  // all good, with results
 
+    // Optional convenience text your UI can use directly
     let uiHint;
     if (verdict === 'ok') {
       uiHint = `Successfully retrieved slots from ${succeeded} club(s). See results below.`;
@@ -493,12 +507,13 @@ app.get('/availability', async (req, res) => {
         failed,
         clubsWithSlots,
         totalslots,
-        verdict, // 'ok' | 'partial_ok' | 'empty_ok' | 'error'
-        uiHint
+        verdict,     // one of: 'ok' | 'partial_ok' | 'empty_ok' | 'error'
+        uiHint       // optional helper string (use counts if you prefer building your own)
       },
       debug
     });
   } catch (e) {
+    // catastrophic failure (before/around browser setup)
     return res.status(500).json({
       error: 'scrape failed',
       detail: String(e),
@@ -520,14 +535,10 @@ app.get('/availability', async (req, res) => {
 
 
 
-// GET /price
-// Params:
-//   slug        = club slug (e.g. "padelikeskus")   [required]
-//   date        = YYYY-MM-DD                        [required]
-//   resourceId  = court resource UUID               [required]
-//   start       = "HH:MM"                           [required]
-//   end         = "HH:MM"                           [preferred]
-//   duration    = 60|90|120                         [fallback if end not provided]
+
+/* =========================
+   Single-slot price verifier — simple & strict
+   ========================= */
 app.get('/price', async (req, res) => {
   const BASE = 'https://playtomic.com';
 
@@ -538,49 +549,179 @@ app.get('/price', async (req, res) => {
   let   endHH      = normHHMM(String(req.query.end   || ''));
   let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
-  // Quick sanity
+  // ---- tiny helpers (pure)
+  const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
+  const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
+  const diffMin = (a,b) => ((b - a + 1440) % 1440);
+  const hhVariants = (hhmm) => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || ''));
+    if (!m) return [String(hhmm || '')];
+    const H = parseInt(m[1], 10), M = m[2];
+    return [...new Set([`${H}:${M}`, `${String(H).padStart(2,'0')}:${M}`])];
+  };
+
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
 
-  // Derive end/duration
+  // prefer duration if both provided but disagree
+  if (endHH && duration) {
+    const inferred = diffMin(hmToMin(startHH), hmToMin(endHH));
+    if (Math.abs(inferred - duration) >= 5) {
+      endHH = minToHHMM(hmToMin(startHH) + duration);
+    }
+  }
   if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
-  if (!duration && endHH) duration = ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
+  if (!duration && endHH) duration = diffMin(hmToMin(startHH), hmToMin(endHH));
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
 
-  // Snap duration to [60,90,120] if off by a minute or two
-  const allowedDur = [60, 90, 120];
-  if (!allowedDur.includes(duration)) {
-    const nearest = allowedDur.reduce((best, v) =>
-      Math.abs(v - duration) < Math.abs(best - duration) ? v : best, allowedDur[0]);
-    duration = nearest;
-    endHH = minToHHMM(hmToMin(startHH) + duration);
+  // Normalize duration to 60/90/120 if slightly off
+  const allowed = [60, 90, 120];
+  if (!allowed.includes(duration)) {
+    duration = allowed.reduce((best, v) =>
+      Math.abs(v - duration) < Math.abs(best - duration) ? v : best, allowed[0]);
   }
 
+  // ---- local minimal helpers (route-private)
+  async function getGridScroller(page) {
+    const handle = await page.evaluateHandle(() => {
+      const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+      const getScrollableParent = (el) => {
+        let p = el?.parentElement;
+        while (p) {
+          const cs = getComputedStyle(p);
+          if (/(auto|scroll)/.test(cs.overflowY)) return p;
+          p = p.parentElement;
+        }
+        return null;
+      };
+      return sample ? getScrollableParent(sample) : (document.scrollingElement || document.body);
+    });
+    return handle;
+  }
+
+  async function queryBlockLocator(page, rid, start, end) {
+    // try both H:MM and HH:MM variants
+    for (const s of hhVariants(start)) {
+      for (const e of hhVariants(end)) {
+        let base = page.locator(`div[data-court-id="${rid}"][data-start-hour="${s}"][data-end-hour="${e}"]`);
+        if (await base.count()) {
+          const abs = base.locator('xpath=.//div[contains(@class,"absolute")]').first();
+          if (await abs.count()) return abs;
+          return base.first();
+        }
+      }
+    }
+    return null;
+  }
+
+  async function clickExactBlock(page, rid, start, end, sweeps = 30) {
+    // try in current viewport first
+    let loc = await queryBlockLocator(page, rid, start, end);
+    if (loc && await loc.count()) {
+      try { await loc.scrollIntoViewIfNeeded(); } catch {}
+      await loc.click({ force: true }).catch(()=>{});
+      return true;
+    }
+    // sweep down the grid to trigger virtualization rendering
+    for (let i = 0; i < sweeps; i++) {
+      const sc = await getGridScroller(page);
+      const moved = await page.evaluate(sc => {
+        const before = sc ? sc.scrollTop : window.scrollY;
+        const delta = Math.floor((sc ? sc.clientHeight : window.innerHeight) * 0.9);
+        if (sc) sc.scrollTop = Math.min(sc.scrollHeight, before + delta);
+        else window.scrollTo(0, before + delta);
+        return (sc ? sc.scrollTop : window.scrollY) !== before;
+      }, sc).catch(() => false);
+      try { await sc?.dispose(); } catch {}
+      await page.waitForTimeout(120);
+
+      loc = await queryBlockLocator(page, rid, start, end);
+      if (loc && await loc.count()) {
+        try { await loc.scrollIntoViewIfNeeded(); } catch {}
+        await loc.click({ force: true }).catch(()=>{});
+        return true;
+      }
+      if (!moved) break; // reached end
+    }
+    return false;
+  }
+
+  async function waitForTooltip(page, timeoutMs = 4000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      // the popup container you showed is an absolutely positioned div that contains a Continue button
+      const tip = page.locator('div.absolute').filter({ has: page.getByRole('button', { name: /continue/i }) }).first();
+      if (await tip.isVisible().catch(()=>false)) return tip;
+      await page.waitForTimeout(100);
+    }
+    return null;
+  }
+
+  async function readRowsFromTooltip(tip) {
+    // First try the explicit row pattern you pasted.
+    let rows = await tip.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
+    if (!rows.length) {
+      // Fallback: any two-div row with duration on the left and money on the right
+      rows = await tip.locator('div').all().catch(()=>[]);
+    }
+
+    const norm = s => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    const out = [];
+    for (const r of rows) {
+      const kids = r.locator(':scope > div');
+      if ((await kids.count()) !== 2) continue;
+      const left  = norm(await kids.nth(0).innerText().catch(()=>'')); // "1h 30m"
+      const right = norm(await kids.nth(1).innerText().catch(()=>'')); // "54 EUR"
+
+      const looksDur   = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
+      const looksMoney = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
+      if (!looksDur || !looksMoney) continue;
+
+      let minutes = null, m;
+      const s = left.toLowerCase();
+      if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) minutes = (+m[1])*60 + (+m[2]);
+      else if ((m = s.match(/(\d+)\s*h(?![a-z])/)))  minutes = (+m[1])*60;
+      else if ((m = s.match(/(\d{1,3})\s*m/)))       minutes = (+m[1]);
+
+      if (minutes) out.push({ label: left, minutes, price: right });
+    }
+    return out;
+  }
+
+  async function readContinuePrice(page, timeoutMs = 1500) {
+    const t0 = Date.now(), moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
+    while (Date.now() - t0 < timeoutMs) {
+      const btn = page.getByRole('button', { name: /continue/i }).first();
+      if (await btn.count()) {
+        const txt = (await btn.textContent()) || '';
+        const m = txt.match(moneyRe);
+        if (m) return m[0].replace(/\s+/g, ' ').trim();
+      }
+      await page.waitForTimeout(100);
+    }
+    return null;
+  }
+
+  // ---- main
   const debug = {
     slug, date, resourceId, startHH, endHH, duration,
     url: `${BASE}/clubs/${encodeURIComponent(slug)}`,
     steps: [],
     clicked: false,
-    courtName: null,
-    tooltipFound: false,
-    tooltipHeaderMatch: { name: null, time: null },
+    tooltip: null,
     rows: [],
-    chosen: null,
-    fallbacks: {}
+    chosen: null
   };
-
-  const HARD_DEADLINE_MS = 15000;
-  const deadline = Date.now() + HARD_DEADLINE_MS;
 
   let context, page;
   try {
     context = await newContext();
     page = await context.newPage();
 
-    // Trim trackers
+    // light filtering for speed
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -591,50 +732,18 @@ app.get('/price', async (req, res) => {
       route.continue();
     });
 
-    // Nav + hydrate
-    if (Date.now() > deadline) throw new Error('timeout_before_nav');
-    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: Math.max(1, deadline - Date.now()) });
-    await page.waitForSelector('#__next', { timeout: Math.max(1, deadline - Date.now()) }).catch(() => {});
-    await autoDismissConsent(page).catch(() => {});
-    await page.evaluate(() => window.scrollTo(0, 0)).catch(()=>{});
+    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForSelector('#__next', { timeout: 15000 }).catch(()=>{});
+    await autoDismissConsent(page).catch(()=>{});
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
-    // Pick date
-    if (Date.now() > deadline) throw new Error('timeout_before_date');
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // Row court name (used to anchor correct tooltip)
-    debug.courtName = await getCourtNameForResource(page, resourceId);
-
-    // Click exact slot (resourceId + start + end)
-    if (Date.now() > deadline) throw new Error('timeout_before_click');
-    const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
-    debug.clicked = !!clickRes?.clicked;
-    debug.courtName = clickRes?.courtName || debug.courtName || null;
-    await page.waitForTimeout(500);
-
-     try {
-  const loc = await findSlotLocator(page, resourceId, startHH, endHH);
-  const bb = loc ? await loc.boundingBox().catch(() => null) : null;
-  if (bb) {
-    await page.mouse.move(bb.x + bb.width/2, bb.y + Math.min(bb.height/2, 8));
-    await page.waitForTimeout(200); // park cursor briefly
-  }
-} catch {}
-
+    // 1) click the exact block by attributes (strict)
+    debug.clicked = await clickExactBlock(page, resourceId, startHH, endHH, 36);
     if (!debug.clicked) {
-      // fallback 1: availability JSON
-      const jPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration).catch(()=>null);
-      if (jPrice) {
-        debug.fallbacks.availability_json = true;
-        return res.json({
-          slug, date, resourceId, startTime: startHH, endTime: endHH,
-          price: jPrice, source: 'availability_json', debug
-        });
-      }
-      // no price
       return res.json({
         slug, date, resourceId,
         startTime: startHH, endTime: endHH,
@@ -644,66 +753,33 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // === NEW robust popup finder (tolerant to different HTML structures) ===
-    const tip = await findBookingPopup(page, { courtName: debug.courtName, startHH }, Math.max(900, deadline - Date.now()));
-    if (tip) {
-      debug.tooltipFound = true;
-
-      // best-effort header capture
-      try {
-        let header = tip.locator('.flex.flex-row.justify-between.font-bold').first();
-        if (!(await header.count())) {
-          header = tip.locator('div').filter({
-            has: page.locator(':scope > div:nth-child(2)', { hasText: /\b\d{1,2}:\d{2}\b/ })
-          }).first();
-        }
-        const kids = header.locator(':scope > div');
-        debug.tooltipHeaderMatch.name = (await kids.nth(0).innerText().catch(()=>null)) || null;
-        debug.tooltipHeaderMatch.time = (await kids.nth(1).innerText().catch(()=>null)) || null;
-      } catch {}
-
-      const rows = await readRowsFromTooltip(tip);
-      debug.rows = rows;
-      const chosen = rows.find(r => r.minutes === duration) || null;
-      debug.chosen = chosen;
-
-      if (chosen) {
-        return res.json({
-          slug, date, resourceId,
-          startTime: startHH, endTime: endHH,
-          price: chosen.price,
-          source: 'popup_row',
-          debug
-        });
-      }
-    }
-
-    // fallback 2: Availability JSON (server responses)
-    const jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration).catch(()=>null);
-    if (jsonPrice) {
-      debug.fallbacks.availability_json = true;
+    // 2) wait for the tooltip created by the click
+    const tip = await waitForTooltip(page, 4000);
+    if (!tip) {
       return res.json({
-        slug, date, resourceId, startTime: startHH, endTime: endHH,
-        price: jsonPrice, source: 'availability_json', debug
+        slug, date, resourceId,
+        startTime: startHH, endTime: endHH,
+        price: '? EUR',
+        source: 'no_tooltip',
+        debug: { ...debug, tooltip: 'not_found' }
       });
     }
+    debug.tooltip = 'found';
 
-    // fallback 3: "Continue XX EUR" button text (if present)
-    const btnPrice = await readContinuePrice(page, 2000);
-    if (btnPrice) {
-      debug.fallbacks.continue_button = true;
-      return res.json({
-        slug, date, resourceId, startTime: startHH, endTime: endHH,
-        price: btnPrice, source: 'continue_button', debug
-      });
-    }
+    // 3) read rows and pick the requested duration
+    const rows = await readRowsFromTooltip(tip);
+    debug.rows = rows;
+    const chosen = rows.find(r => r.minutes === duration) || null;
+    debug.chosen = chosen;
 
-    // nothing found
+    let price = chosen?.price || null;
+    if (!price) price = await readContinuePrice(page, 1200); // last resort
+
     return res.json({
       slug, date, resourceId,
       startTime: startHH, endTime: endHH,
-      price: '? EUR',
-      source: 'popup_not_found',
+      price: price || '? EUR',
+      source: chosen ? 'popup_row' : (price ? 'continue_btn' : 'popup'),
       debug
     });
 
@@ -717,424 +793,57 @@ app.get('/price', async (req, res) => {
 
 
 
+
+
+
+
+
 /* =========================
-   Helpers (single, de-duplicated)
+   Helpers
    ========================= */
 
-// Robust popup finder that works for tooltip OR modal variants
-async function findBookingPopup(page, { courtName, startHH }, timeoutMs = 4500) {
-   console.log('POPUP_FINDER_ACTIVE', { version: 'A2', at: Date.now() });
-  const deadline = Date.now() + timeoutMs;
-
-  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
-  const toHMM = s => {
-    const m = /(\d{1,2}):(\d{2})/.exec(String(s||'')); 
-    return m ? `${parseInt(m[1],10)}:${m[2]}` : null; // strip leading zero in hours
-  };
-  const wantName = courtName ? norm(courtName) : null;
-  const wantTime = toHMM(startHH);
-
-  // cover both tooltip & dialog-style containers
-  const containerSel = [
-    '[role="dialog"]',
-    '[aria-modal="true"]',
-    '[role="tooltip"]',
-    'div[style*="position: fixed"]',
-    'div[style*="position: absolute"]',
-    'div.fixed',
-    'div.absolute',
-    '[data-state="open"]',
-    'div[class*="z-50"]'
-  ].join(', ');
-
-  while (Date.now() < deadline) {
-    const pops = page.locator(containerSel);
-    const n = await pops.count().catch(() => 0);
-
-    for (let i = 0; i < n; i++) {
-      const p = pops.nth(i);
-
-      // Must be visible and reasonably sized
-      try {
-        //const bb = await p.boundingBox().catch(() => null); debiil
-        //if (!bb || bb.width < 160 || bb.height < 80) continue;
-      } catch { continue; }
-
-      // If we can find a header row, confirm time/name there
-      let header = p.locator('.flex.flex-row.justify-between.font-bold').first();
-      if (!(await header.count())) {
-        header = p.locator('div').filter({
-          has: page.locator(':scope > div:nth-child(2)', { hasText: /\b\d{1,2}:\d{2}\b/ })
-        }).first();
-      }
-      if (await header.count()) {
-        const kids = header.locator(':scope > div');
-        const leftName  = ((await kids.nth(0).innerText().catch(()=>'')) || '').toString();
-        const rightTime = ((await kids.nth(1).innerText().catch(()=>'')) || '').toString();
-
-        const nameOk = !wantName || norm(leftName).includes(wantName) || wantName.includes(norm(leftName));
-        const timeOk = !wantTime || toHMM(rightTime) === wantTime;
-
-        if (nameOk && timeOk) return p;
-      }
-
-      // Otherwise, accept containers that clearly contain duration+price rows
-      const innerText = (await p.innerText().catch(()=>'')) || '';
-      const hasMoney  = /(EUR|€|\$|USD|GBP|£|kr)/i.test(innerText);
-      const hasDur    = /(\d+\s*h\s*\d{0,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(innerText);
-      const hasTime   = wantTime ? new RegExp(`\\b${wantTime}\\b`).test(innerText) : true;
-      const hasName   = wantName ? norm(innerText).includes(wantName) : true;
-
-      if (hasMoney && hasDur && hasTime && hasName) return p;
-    }
-
-    await page.waitForTimeout(120);
-  }
-   // No match — dump candidates for diagnosis
-try {
-  const dump = await page.evaluate(() => {
-    const sels = [
-      '[role="dialog"]','[aria-modal="true"]','[role="tooltip"]',
-      'div.fixed','div.absolute','[data-state="open"]','div[class*="z-"]'
-    ];
-    const seen = new Set(), out = [];
-    const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
-
-    for (const sel of sels) {
-      document.querySelectorAll(sel).forEach(el => {
-        if (seen.has(el)) return;
-        seen.add(el);
-        const r = el.getBoundingClientRect();
-        const header = el.querySelector('.flex.flex-row.justify-between.font-bold');
-        out.push({
-          sel,
-          w: Math.round(r.width), h: Math.round(r.height),
-          vis: !!(r.width && r.height && r.bottom > 0 && r.right > 0),
-          z: getComputedStyle(el).zIndex,
-          header: header ? norm(header.textContent).slice(0,180) : null,
-          txt: norm(el.innerText || '').slice(0,240)
-        });
-      });
-    }
-    return out;
+// Sweep the scrollable grid so lazy/virtual rows render
+async function sweepVirtualizedGrid(page) {
+  const handle = await page.evaluateHandle(() => {
+    const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+    const sc = sample?.closest('[class*="overflow"]') || document.scrollingElement || document.body;
+    return sc;
   });
-  console.log('POPUP_CANDIDATES', dump);
-} catch (e) {
-  console.log('POPUP_CANDIDATES_ERROR', String(e));
-}
-return null;
-}
 
-// Extract rows like ["1h 30m","54 EUR"] from a tooltip/modal container Locator
-async function readRowsFromTooltip(tip) {
-  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
-  const rows = [];
-
-  // Prefer the obvious row selector first, fallback to scanning all divs
-  const candidates = await tip.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
-  const scan = candidates.length ? candidates : await tip.locator('div').all().catch(()=>[]);
-
-  for (const r of scan) {
-    const kids = r.locator(':scope > div');
-    if ((await kids.count().catch(()=>0)) !== 2) continue;
-
-    const left  = norm(await kids.nth(0).innerText().catch(()=>'')); // "2h 00m"
-    const right = norm(await kids.nth(1).innerText().catch(()=>'')); // "72 EUR"
-
-    const looksDur   = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
-    const looksMoney = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
-    if (!looksDur || !looksMoney) continue;
-
-    // parse minutes from "Xh YYm" | "Xh" | "YYm"
-    let minutes = null, m;
-    const s = left.toLowerCase();
-    if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) minutes = (+m[1])*60 + (+m[2]);
-    else if ((m = s.match(/(\d+)\s*h(?![a-z])/)))  minutes = (+m[1])*60;
-    else if ((m = s.match(/(\d{1,3})\s*m/)))       minutes = (+m[1]);
-
-    if (minutes) rows.push({ label: left, minutes, price: right });
-  }
-  return rows;
-}
-
-// Fallback: hit the same availability JSON the page uses, and match start/duration
-async function priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, durationMin) {
-  try {
-    const result = await page.evaluate(async ({ date, resourceId, startHH, endHH, durationMin }) => {
-      const hhmmss = (hhmm) => /\d{2}:\d{2}/.test(hhmm) ? `${hhmm}:00` : hhmm;
-      const wantStart = hhmmss(startHH);
-
-      const toMin = (s) => { const [H,M]=s.split(':').map(Number); return (H|0)*60 + (M|0); };
-      const wantDur = (durationMin|0) || (endHH ? ((toMin(endHH)-toMin(startHH)+1440)%1440) : 0);
-
-      const el = document.querySelector('script#__NEXT_DATA__');
-      const data = el ? JSON.parse(el.textContent || '{}') : null;
-
-      const findUuid = (n) => {
-        if (!n || typeof n !== 'object') return null;
-        if (typeof n.id === 'string' &&
-            /^[0-9a-f-]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(n.id)) return n.id;
-        for (const v of Object.values(n)) { const got = findUuid(v); if (got) return got; }
-        return null;
-      };
-
-      const clubId = findUuid(data);
-      if (!clubId) return null;
-
-      const url = `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&date=${encodeURIComponent(date)}`;
-      const resp = await fetch(url, { credentials: 'same-origin' });
-      if (!resp.ok) return null;
-      const arr = await resp.json();
-
-      for (const row of Array.isArray(arr) ? arr : []) {
-        if (String(row.resource_id) !== String(resourceId)) continue;
-        for (const sl of row.slots || []) {
-          const st = String(sl.start_time || '');
-          const dur = (sl.duration|0);
-          if (!st.startsWith(wantStart)) continue;
-          if (wantDur && dur !== wantDur) continue;
-          const price = String(sl.price || '').trim();
-          if (price) return price;
-        }
-      }
-      return null;
-    }, { date, resourceId, startHH, endHH, durationMin });
-    return result || null;
-  } catch { return null; }
-}
-
-// Fallback: read "Continue – XX EUR" button text if visible
-async function readContinuePrice(page, timeoutMs = 2000) {
-  const start = Date.now();
-  const moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR|\$|USD|£|GBP|kr)\b/i;
-
-  while (Date.now() - start < timeoutMs) {
-    const btn = page.getByRole('button', { name: /continue/i }).first();
-    if (await btn.count()) {
-      const txt = (await btn.textContent()) || '';
-      const m = txt.match(moneyRe);
-      if (m) return m[0].replace(/\s+/g, ' ').trim();
-    }
-    await page.waitForTimeout(150);
-  }
-  return null;
-}
-
-
-// Find the scroll grid row label (court name) for a given resource
-async function getCourtNameForResource(page, rid) {
-  try {
-    return await page.evaluate((resourceId) => {
-      const block = document.querySelector(`div[data-court-id="${resourceId}"]`);
-      if (!block) return null;
-      const row = block.closest('div.flex.border-b');
-      const name = row?.querySelector('.truncate')?.textContent || '';
-      return name.replace(/\u00a0/g, ' ').trim() || null;
-    }, rid);
-  } catch { return null; }
-}
-
-// Find the *right* tooltip by matching header: left=name, right=time (tolerant)
-// We do NOT require a "Continue" button. Returns a Locator or null.
-async function findTooltipByHeader(page, expectName, expectStart, timeoutMs = 4500) {
-   console.log('POPUP_FINDER_ACTIVE', { version: 'A1', at: Date.now() });
-  const deadline = Date.now() + timeoutMs;
-
-  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
-  const toHMM = s => {
-    const m = /(\d{1,2}):(\d{2})/.exec(String(s||'')); 
-    return m ? `${parseInt(m[1],10)}:${m[2]}` : null; // strip leading zero in hours
-  };
-  const wantName = expectName ? norm(expectName) : null;
-  const wantTime = toHMM(expectStart);
-
-  // Candidate containers for the floating tooltip
-  const containerSel = [
-    'div.absolute',
-    'div[style*="position: absolute"]',
-    '[role="tooltip"]',
-  ].join(', ');
-
-  while (Date.now() < deadline) {
-    const pops = page.locator(containerSel);
-    const n = await pops.count().catch(() => 0);
-
-    for (let i = 0; i < n; i++) {
-      const p = pops.nth(i);
-      try { await p.waitFor({ state: 'visible', timeout: 100 }); } catch {}
-
-      // header: try the known class first, then any row with two <div> children where the right is time
-      let header = p.locator('.flex.flex-row.justify-between.font-bold').first();
-      if (!(await header.count())) {
-        header = p.locator('div').filter({
-          has: page.locator(':scope > div:nth-child(2)', { hasText: /\b\d{1,2}:\d{2}\b/ })
-        }).first();
-      }
-      if (!(await header.count())) continue;
-
-      const kids = header.locator(':scope > div');
-      if ((await kids.count().catch(()=>0)) < 2) continue;
-
-      const leftName  = (await kids.nth(0).innerText().catch(()=>'')) || '';
-      const rightTime = (await kids.nth(1).innerText().catch(()=>'')) || '';
-
-      const nameOk = !wantName || norm(leftName).includes(wantName) || wantName.includes(norm(leftName));
-      const timeOk = !wantTime || toHMM(rightTime) === wantTime;
-      if (nameOk && timeOk) return p;
-    }
-
-    await page.waitForTimeout(120);
-  }
-  return null;
-}
-
-
-
-// Extract rows like ["1h 30m","54 EUR"] from a tooltip container Locator
-async function readRowsFromTooltip(tip) {
-  const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
-  const rows = [];
-
-  // Try the obvious row selector first
-  const candidates = await tip.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
-  const scan = candidates.length ? candidates : await tip.locator('div').all().catch(()=>[]);
-
-  for (const r of scan) {
-    const kids = r.locator(':scope > div');
-    if ((await kids.count().catch(()=>0)) !== 2) continue;
-
-    const left  = norm(await kids.nth(0).innerText().catch(()=>'')); // "2h 00m"
-    const right = norm(await kids.nth(1).innerText().catch(()=>'')); // "72 EUR"
-
-    const looksDur   = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
-    const looksMoney = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
-    if (!looksDur || !looksMoney) continue;
-
-    // parse minutes from "Xh YYm" | "Xh" | "YYm"
-    let minutes = null, m;
-    const s = left.toLowerCase();
-    if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) minutes = (+m[1])*60 + (+m[2]);
-    else if ((m = s.match(/(\d+)\s*h(?![a-z])/)))  minutes = (+m[1])*60;
-    else if ((m = s.match(/(\d{1,3})\s*m/)))       minutes = (+m[1]);
-
-    if (minutes) rows.push({ label: left, minutes, price: right });
-  }
-  return rows;
-}
-
-// Click a specific slot by resourceId + start + end, tolerant of "H:MM" vs "HH:MM".
-// Returns { clicked: boolean, where: string|null, courtName: string|null }
-async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 24) {
-  function toHMM(hhmm) {
-    const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || ''));
-    if (!m) return null;
-    return `${parseInt(m[1], 10)}:${m[2]}`; // strip leading zero in hours
-  }
-  const wantStart = toHMM(startHH);
-  const wantEnd   = toHMM(endHH);
-
-
-   // --- Playwright-level click first (preferred) ---
-async function tryMouseClickOnce() {
-  // Accept both "H:MM" and "HH:MM"
-  const hhVariants = (hhmm) => {
-    const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
-    if (!m) return [String(hhmm || '')];
-    const H = parseInt(m[1], 10), M = m[2];
-    return [`${H}:${M}`, `${String(H).padStart(2,'0')}:${M}`];
-  };
-
-  const starts = hhVariants(startHH);
-  const ends   = endHH ? hhVariants(endHH) : [null];
-
-  for (const s of starts) {
-    for (const e of ends) {
-      let base = page.locator(`div[data-court-id="${resourceId}"][data-start-hour="${s}"]`);
-      if (e) base = base.filter({ has: page.locator(`[data-end-hour="${e}"]`) });
-      if (await base.count()) {
-        const abs = base.locator('xpath=.//div[contains(@class,"absolute")]').first();
-        const target = (await abs.count()) ? abs : base.first();
-
-        const box = await target.boundingBox().catch(() => null);
-        if (box) {
-          await page.mouse.move(box.x + box.width/2, box.y + Math.min(box.height/2, 8));
-          await page.mouse.click(box.x + box.width/2, box.y + Math.min(box.height/2, 8), { delay: 20 });
-          return { ok: true };
-        } else {
-          // no bbox (possibly offscreen); try force-click the locator
-          try { await target.click({ force: true }); return { ok: true }; } catch {}
-        }
-      }
-    }
-  }
-  return { ok: false };
-}
-
-
-  async function tryClickOnce() {
-    return await page.evaluate(({ rid, s, e }) => {
-      function norm(x) {
-        const m = /^(\d{1,2}):(\d{2})$/.exec(String(x || ''));
-        if (!m) return null;
-        return `${parseInt(m[1], 10)}:${m[2]}`;
-      }
-      const nodes = document.querySelectorAll('div[data-court-id][data-start-hour][data-end-hour]');
-      for (const el of nodes) {
-        if (el.getAttribute('data-court-id') !== rid) continue;
-        const st = norm(el.getAttribute('data-start-hour'));
-        const en = norm(el.getAttribute('data-end-hour'));
-        if (st === s && en === e) {
-          let courtName = null;
-          try {
-            const row = el.closest('div.flex.border-b.ui-stroke-neutral-default');
-            courtName = (row?.querySelector('.truncate')?.textContent || '').trim() || null;
-          } catch {}
-          try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
-          try { el.click(); return { ok: true, courtName }; } catch {}
-        }
-      }
-      return { ok: false, courtName: null };
-    }, { rid: resourceId, s: wantStart, e: wantEnd });
-  }
-
-  // Try current viewport first
-  const first = await tryClickOnce();
-  if (first?.ok) return { clicked: true, where: 'initial', courtName: first.courtName };
-
-  // Bounded downward sweeps through the scroll container
-  for (let i = 0; i < maxSweeps; i++) {
-    const moved = await page.evaluate(() => {
-      const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
-      const getScrollableParent = (el) => {
-        let p = el && el.parentElement;
-        while (p) {
-          const cs = getComputedStyle(p);
-          if (/(auto|scroll)/.test(cs.overflowY)) return p;
-          p = p.parentElement;
-        }
-        return null;
-      };
-      const sc = sample && getScrollableParent(sample);
-      if (sc) {
-        const before = sc.scrollTop;
-        const delta = Math.floor(sc.clientHeight * 0.9);
-        sc.scrollTop = Math.min(sc.scrollHeight, before + delta);
-        return sc.scrollTop !== before;
+  await page.evaluate(async sc => {
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    let prev = -1, stable = 0;
+    for (let i = 0; i < 12; i++) {
+      sc.scrollTop = 0;
+      await sleep(60);
+      sc.scrollTop = sc.scrollHeight;
+      await sleep(120);
+      const cnt = document.querySelectorAll('div[data-court-id][data-start-hour][data-end-hour]').length;
+      if (cnt === prev) {
+        if (++stable >= 2) break; // two stable reads
       } else {
-        const before = window.scrollY;
-        window.scrollTo(0, before + Math.floor(window.innerHeight * 0.9));
-        return window.scrollY !== before;
+        stable = 0;
+        prev = cnt;
       }
-    }).catch(() => false);
-
-    await page.waitForTimeout(120);
-    const again = await tryClickOnce();
-    if (again?.ok) return { clicked: true, where: `sweep_${i+1}`, courtName: again.courtName };
-    if (!moved) break; // reached end
-  }
-
-  return { clicked: false, where: null, courtName: null };
+    }
+  }, handle).catch(() => {});
+  try { await handle.dispose(); } catch {}
 }
+
+// Wait for “quiet” mutations (grid not changing)
+async function waitForGridQuiet(page, ms = 600) {
+  await page.evaluate((quietMs) => new Promise(resolve => {
+    const root = document.getElementById('__next') || document.body;
+    let timer;
+    const obs = new MutationObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { obs.disconnect(); resolve(); }, quietMs);
+    });
+    obs.observe(root, { childList: true, subtree: true });
+    timer = setTimeout(() => { obs.disconnect(); resolve(); }, quietMs); // nothing happened
+  }), ms).catch(()=>{});
+}
+
 
 // Wait until the Next.js app looks “hydrated” (rough heuristic)
 async function ensureHydrated(page) {
@@ -1174,7 +883,7 @@ async function autoDismissConsent(page) {
   }
 }
 
-// Open the “Today/Tomorrow” pill (date picker). Returns true if clicked/opened.
+// Open the “Today” pill (date picker). Returns true if clicked/opened.
 async function openDatePicker(page) {
   const candidates = [
     'button:has-text("Today")',
@@ -1192,6 +901,7 @@ async function openDatePicker(page) {
 }
 
 // Compute month delta between header like "October 2025" and target YYYY-MM-DD.
+// Returns 0 if parsing fails (we’ll still try clicking the day directly).
 function computeMonthDelta(headerText, targetYmd) {
   if (!headerText) return 0;
   const m = headerText.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\b\s+(\d{4})/i);
@@ -1256,7 +966,7 @@ async function forceDateInUI(page, ymd) {
     await page.keyboard.press('Escape').catch(()=>{});
     await page.mouse.click(10, 10).catch(()=>{});
 
-    // Wait for XHR to commit for the chosen date
+    // Wait for XHR to commit for the chosen date (best signal)
     const saw = await page.waitForResponse(
       r => r.url().includes('/api/clubs/availability') && r.url().includes(`date=${ymd}`),
       { timeout: 8000 }
@@ -1275,12 +985,13 @@ async function forceDateInUI(page, ymd) {
 }
 
 // Collect club name and per-court metadata (name + tags) from the current page
+// Collect club name and per-court metadata (name + tags) from the current page
 async function collectCourtMeta(page) {
   // Club name from <title>, clean marketing bits
   const rawTitle = await page.title().catch(() => '') || '';
   const clubName = (rawTitle || '')
-    .replace(/^Book a court\s+(?:at|in)\s+/i, '')
-    .replace(/\s*\|\s*Playtomic\s*$/i, '')
+    .replace(/^Book a court\s+(?:at|in)\s+/i, '')   // handle "at" or "in"
+    .replace(/\s*\|\s*Playtomic\s*$/i, '')          // drop " | Playtomic"
     .trim() || null;
 
   // Build a per-resource meta index by walking each “row”
@@ -1288,15 +999,17 @@ async function collectCourtMeta(page) {
     const out = {};
     for (const row of rows) {
       const name = (row.querySelector('.truncate')?.textContent || '').trim() || null;
+      // grab the *first* block in the row to read its resource id
       const block = row.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
       const rid = block?.getAttribute('data-court-id') || null;
 
+      // tags are shown in that hover tooltip (they’re in the DOM even if hidden)
       const tooltip = row.querySelector('.group .text-sm:last-child');
       const tagsText = (tooltip?.textContent || '').toLowerCase();
       const tags = tagsText.split(',').map(s => s.trim()).filter(Boolean);
 
-      const size = tags.find(t => t.includes('single') || t.includes('double')) || null;
-      const location = tags.find(t => t.includes('indoor') || t.includes('outdoor')) || null;
+      const size = tags.find(t => t.includes('single') || t.includes('double')) || null;      // e.g. "double"
+      const location = tags.find(t => t.includes('indoor') || t.includes('outdoor')) || null; // e.g. "indoor"
 
       if (rid) {
         out[rid] = { courtName: name, size, location };
@@ -1308,8 +1021,19 @@ async function collectCourtMeta(page) {
   return { clubName, courts };
 }
 
-// Build `${resourceId}|HH:MM|HH:MM` and `${resourceId}|HH:MM|` index from availability payload(s)
+
 function buildPriceIndex(payload, targetDate) {
+  // Keys we produce:
+  //   `${resourceId}|HH:MM|HH:MM`  (exact start+end)
+  //   `${resourceId}|HH:MM|`       (start-only fallback)
+  //
+  // Matches Playtomic array like:
+  // [
+  //   { resource_id: 'uuid', start_date: 'YYYY-MM-DD', slots: [
+  //       { start_time:'21:00:00', duration:60, price:'28 EUR' }, ...
+  //   ]},
+  //   ...
+  // ]
   const map = new Map();
 
   const toHHMM = (s) => {
@@ -1356,21 +1080,106 @@ function buildPriceIndex(payload, targetDate) {
   return map;
 }
 
+
+
+
+async function collectAllBlocks(page) {
+  // 1) Nudge the list to the very top first
+  await page.evaluate(() => {
+    const first = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+    if (!first) return;
+    const getScrollableParent = (el) => {
+      let p = el.parentElement;
+      while (p) {
+        const cs = getComputedStyle(p);
+        if (/(auto|scroll)/.test(cs.overflowY)) return p;
+        p = p.parentElement;
+      }
+      return null;
+    };
+    const sc = getScrollableParent(first);
+    if (sc) sc.scrollTop = 0;
+    window.scrollTo(0, 0);
+  }).catch(() => {});
+
+  // 2) Sweep downward, deduping as we go
+  const seen = new Set();
+  const key = (b) => [b.courtId, b.start, b.end].join('|');
+
+  let stuckCount = 0;
+  let lastPos = -1;
+
+  for (let i = 0; i < 60; i++) {
+    // collect what's currently rendered
+    const chunk = await page.$$eval(
+      'div[data-court-id][data-start-hour][data-end-hour]',
+      (els) => els.map((el) => ({
+        courtId: el.getAttribute('data-court-id'),
+        start:   el.getAttribute('data-start-hour'),
+        end:     el.getAttribute('data-end-hour'),
+      }))
+    ).catch(() => []);
+
+    for (const b of chunk) {
+      if (b && b.courtId && b.start && b.end) seen.add(key(b));
+    }
+
+    // scroll one screen down in the correct container (or window fallback)
+    const pos = await page.evaluate(() => {
+      const first = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+      const getScrollableParent = (el) => {
+        let p = el && el.parentElement;
+        while (p) {
+          const cs = getComputedStyle(p);
+          if (/(auto|scroll)/.test(cs.overflowY)) return p;
+          p = p.parentElement;
+        }
+        return null;
+      };
+      const sc = first && getScrollableParent(first);
+      const delta = Math.floor((sc ? sc.clientHeight : window.innerHeight) * 0.9);
+
+      let before, after, max;
+      if (sc) {
+        before = sc.scrollTop;
+        sc.scrollTop = Math.min(sc.scrollHeight, sc.scrollTop + delta);
+        after = sc.scrollTop;
+        max = sc.scrollHeight - sc.clientHeight - 1; // -1 for float fuzz
+      } else {
+        before = window.scrollY;
+        window.scrollTo(0, window.scrollY + delta);
+        after = window.scrollY;
+        max = document.documentElement.scrollHeight - window.innerHeight - 1;
+      }
+      return { before, after, max };
+    }).catch(() => ({ before: 0, after: 0, max: 0 }));
+
+    await page.waitForTimeout(120);
+
+    // stop if we can't move any further
+    if (pos.after === pos.before || pos.after >= pos.max) {
+      stuckCount++;
+      if (stuckCount >= 2) break; // reached (or very near) the end twice
+    } else {
+      stuckCount = 0;
+    }
+
+    // also stop if position doesn't change at all across iterations (belt & suspenders)
+    if (pos.after === lastPos) break;
+    lastPos = pos.after;
+  }
+
+  return Array.from(seen).map((k) => {
+    const [courtId, start, end] = k.split('|');
+    return { courtId, start, end };
+  });
+}
+
+
 /* =========================
    Start server
    ========================= */
 app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
+   
 });
-
-// Graceful shutdown
-async function shutdown() {
-  try { await BROWSER?.close(); } catch {}
-  process.exit(0);
-}
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-
-
-
-
