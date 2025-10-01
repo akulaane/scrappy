@@ -537,7 +537,6 @@ perClubItems.push({
     try { await context?.close(); } catch {}
   }
 });
-
 /* =========================
    Single-slot price verifier
    ========================= */
@@ -560,21 +559,94 @@ app.get('/price', async (req, res) => {
   let   endHH      = normHHMM(String(req.query.end   || ''));
   let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
-  // local helpers
-  const hmToMin   = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
+  const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
   const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
 
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
 
-  // derive the missing one if only one of (endHH, duration) is provided
+  // derive the missing piece
   if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
   if (!duration && endHH) duration = ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
-
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
+
+  // --- helpers local to this route ---
+  const readPopupDurationMap = async (page, timeoutMs = 4500) => {
+    // Wait for the popup to appear (the Continue button is a stable anchor)
+    await page.waitForSelector('button:has-text("Continue")', { timeout: timeoutMs }).catch(() => {});
+    // Grab rows that look like:  <div>1h 30m</div><div>36 EUR</div>
+    const pairs = await page.$$eval(
+      'div.flex.cursor-pointer.flex-row.justify-between.rounded-md.border',
+      nodes => nodes.map(n => {
+        const left  = (n.querySelector('div:first-child')?.textContent || '').trim();
+        const right = (n.querySelector('div:last-child')?.textContent  || '').trim();
+        return { left, right };
+      })
+    ).catch(() => []);
+
+    const map = new Map(); // minutes -> "NN EUR"
+    for (const { left, right } of pairs) {
+      const m = left.match(/(\d+)\s*h\s*(\d{2})\s*m/i);
+      if (!m) continue;
+      const mins = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+      if (right && /\d/.test(right)) map.set(mins, right);
+    }
+    return map;
+  };
+
+  const fetchJsonPrice = async (page, date, resourceId, startHH, wantMins) => {
+    try {
+      const result = await page.evaluate(async (args) => {
+        const { date, resourceId, startHH, wantMins } = args;
+        const el = document.querySelector('script#__NEXT_DATA__');
+        let clubId = null;
+        try {
+          const data = el ? JSON.parse(el.textContent || '{}') : null;
+          const findUuid = (n) => {
+            if (!n || typeof n !== 'object') return null;
+            if (typeof n.id === 'string' &&
+                /^[0-9a-f-]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(n.id)) {
+              return n.id;
+            }
+            for (const v of Object.values(n)) {
+              const got = findUuid(v);
+              if (got) return got;
+            }
+            return null;
+          };
+          clubId = findUuid(data);
+        } catch {}
+
+        if (!clubId) return { price: null, why: 'no_club_id' };
+
+        const url = `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&date=${encodeURIComponent(date)}`;
+        const resp = await fetch(url, { credentials: 'same-origin' });
+        if (!resp.ok) return { price: null, why: 'resp_not_ok' };
+
+        const payload = await resp.json();
+        const arr = Array.isArray(payload) ? payload : [];
+
+        const startSS = `${startHH}:00`;
+        for (const entry of arr) {
+          if (!entry || entry.resource_id !== resourceId) continue;
+          const slots = Array.isArray(entry.slots) ? entry.slots : [];
+          for (const s of slots) {
+            if (String(s.start_time) === startSS && Number(s.duration) === Number(wantMins)) {
+              return { price: String(s.price || '').trim(), why: 'matched' };
+            }
+          }
+        }
+        return { price: null, why: 'no_match' };
+      }, { date, resourceId, startHH, wantMins });
+
+      return result?.price || null;
+    } catch {
+      return null;
+    }
+  };
 
   let context, page;
   const debug = {
@@ -582,7 +654,7 @@ app.get('/price', async (req, res) => {
     url: `${BASE}/clubs/${encodeURIComponent(slug)}`,
     steps: [],
     clicked: null,
-    durationPicked: null,
+    popupDurations: [],
     domPrice: null,
     jsonPrice: null,
     source: null
@@ -592,7 +664,7 @@ app.get('/price', async (req, res) => {
     context = await newContext();
     page = await context.newPage();
 
-    // Trim trackers for speed
+    // trim trackers for speed
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -603,7 +675,7 @@ app.get('/price', async (req, res) => {
       route.continue();
     });
 
-    // Navigate + hydrate
+    // nav + hydrate
     await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector('#__next', { timeout: 30000 }).catch(() => {});
     await autoDismissConsent(page).catch(() => {});
@@ -611,44 +683,43 @@ app.get('/price', async (req, res) => {
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
-    // Pick the date in the UI (so the correct grid renders)
+    // date → UI grid
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // Click the exact slot (auto-scroll & tolerate 0:30/00:30)
+    // click the slot on the grid
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
-    debug.clicked = !!clickRes?.clicked;
+    debug.clicked = !!(clickRes && clickRes.clicked);
 
-    // If clicked, select requested duration (if provided) and read DOM price
+    // If clicked, read all duration rows from the popup and pick the exact one
     if (debug.clicked) {
-      if (duration) {
-        // (helper should click the "1h 00m" / "1h 30m" / "2h 00m" option and wait for the button to update)
-        debug.durationPicked = await selectDurationOption(page, duration, 4000);
-      }
-      // Read "Continue — XX EUR" (your helper may accept (page, timeoutMs) or (page, settleMs, timeoutMs);
-      // keeping the single-arg call for compatibility with your current helper)
-      debug.domPrice = await readContinuePrice(page, 6000);
-      if (debug.domPrice) {
-        debug.source = 'dom';
+      const map = await readPopupDurationMap(page, 5000);
+      debug.popupDurations = Array.from(map.keys());  // e.g. [60,90,120]
+      const want = duration || ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
+      const domPrice = map.get(want) || null;
+      debug.domPrice = domPrice;
+
+      if (domPrice) {
+        debug.source = 'popup';
         return res.json({
           slug, date, resourceId,
           startTime: startHH,
-          endTime: endHH || minToHHMM(hmToMin(startHH) + duration),
-          price: debug.domPrice,
-          source: 'dom',
+          endTime: endHH,
+          price: domPrice,
+          source: 'popup',
           debug
         });
       }
     }
 
-    // DOM failed or not clickable — fall back to availability JSON (single fetch inside page)
-    debug.jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration);
+    // Fallback: use availability JSON for this date
+    debug.jsonPrice = await fetchJsonPrice(page, date, resourceId, startHH, duration);
     debug.source = debug.jsonPrice ? 'json' : 'unknown';
 
     return res.json({
       slug, date, resourceId,
       startTime: startHH,
-      endTime: endHH || minToHHMM(hmToMin(startHH) + duration),
+      endTime: endHH,
       price: debug.jsonPrice || '? EUR',
       source: debug.source,
       debug
@@ -1395,6 +1466,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
