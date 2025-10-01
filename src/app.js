@@ -538,18 +538,11 @@ perClubItems.push({
   }
 });
 
+
 /* =========================
-   Single-slot price verifier (popup-anchored)
+   Single-slot price verifier (popup anchored by time + court name)
    ========================= */
 
-// GET /price
-// Params:
-//   slug        = club slug (e.g. "padelikeskus")   [required]
-//   date        = YYYY-MM-DD                        [required]
-//   resourceId  = court resource UUID               [required]
-//   start       = "HH:MM"                           [required]
-//   end         = "HH:MM"                           [preferred]
-//   duration    = 60|90|120                         [fallback if end not provided]
 app.get('/price', async (req, res) => {
   const BASE = 'https://playtomic.com';
 
@@ -560,38 +553,107 @@ app.get('/price', async (req, res) => {
   let   endHH      = normHHMM(String(req.query.end   || ''));
   let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
+  // ---- tiny helpers
   const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
   const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
   const minDiff = (a,b) => ((b - a + 1440) % 1440);
+  const allowedDur = [60, 90, 120];
 
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
 
-  // If both end & duration provided but conflict, prefer duration (and recompute end).
+  // Prefer duration when both duration & end are present but disagree.
   if (endHH && duration) {
     const inferred = minDiff(hmToMin(startHH), hmToMin(endHH));
     if (Math.abs(inferred - duration) >= 5) {
       endHH = minToHHMM(hmToMin(startHH) + duration);
     }
   }
-
-  // Derive the missing piece
+  // Derive the missing one
   if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
   if (!duration && endHH) duration = minDiff(hmToMin(startHH), hmToMin(endHH));
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
 
-  // Normalize duration to expected buckets if slightly off (DST etc.)
-  const allowed = [60, 90, 120];
-  let targetDur = duration;
-  if (!allowed.includes(targetDur)) {
-    targetDur = allowed.reduce((best, v) =>
-      Math.abs(v - targetDur) < Math.abs(best - targetDur) ? v : best, allowed[0]);
+  // Snap to nearest 60/90/120 if it’s off a tad (DST, etc.)
+  if (!allowedDur.includes(duration)) {
+    duration = allowedDur.reduce((best, v) =>
+      Math.abs(v - duration) < Math.abs(best - duration) ? v : best, allowedDur[0]);
   }
 
-  // Helpers for popup scraping
+  // ---- robust popup anchoring
+  async function getCourtNameForResource(page, rid) {
+    try {
+      return await page.evaluate((resourceId) => {
+        const block = document.querySelector(`div[data-court-id="${resourceId}"]`);
+        if (!block) return null;
+        let row = block.closest('div.flex.border-b');
+        if (!row) return null;
+        const name = row.querySelector('.truncate')?.textContent || '';
+        return name.trim() || null;
+      }, rid);
+    } catch { return null; }
+  }
+
+  // Find the popup whose header shows the desired start time AND (if known) the same court name.
+  async function pickPopupByStartAndName(page, startHH, courtName, timeoutMs = 7000) {
+    const deadline = Date.now() + timeoutMs;
+    const norm = s => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+
+    while (Date.now() < deadline) {
+      // Limit to “Continue” popups to avoid other overlays
+      const popups = page.locator('div:has(button:has-text("Continue"))');
+      const count = await popups.count().catch(() => 0);
+
+      for (let i = 0; i < count; i++) {
+        const p = popups.nth(i);
+        try { await p.waitFor({ state: 'visible', timeout: 200 }); } catch {}
+
+        const headerVals = await p.locator('.flex.flex-row.justify-between.font-bold div').allTextContents().catch(()=>[]);
+        const leftName   = norm(headerVals?.[0] || '');
+        const rightTime  = norm(headerVals?.[1] || '');
+
+        const timeMatch = rightTime === startHH;
+        const nameMatch = courtName ? leftName.includes(courtName) : true;
+
+        if (timeMatch && nameMatch) {
+          return { popup: p, leftName, rightTime };
+        }
+      }
+      await page.waitForTimeout(120);
+    }
+    return null;
+  }
+
+  // Extract duration rows from a specific popup node
+  async function readRowsFromPopup(popup) {
+    return await popup.evaluate((root) => {
+      const norm = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      const rows = [];
+      // We scan for “two DIV children, left looks like a duration, right looks like money”
+      const nodes = root.querySelectorAll('div');
+      for (const el of nodes) {
+        if (!el.children || el.children.length !== 2) continue;
+        const [a,b] = el.children;
+        if (!a || !b || a.tagName !== 'DIV' || b.tagName !== 'DIV') continue;
+
+        const left  = norm(a.textContent || '');
+        const right = norm(b.textContent || '');
+
+        const looksLikeDuration = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
+        const looksLikeMoney    = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
+
+        if (looksLikeDuration && looksLikeMoney) {
+          rows.push([left, right]);
+        }
+      }
+      return rows;
+    });
+  }
+
+  // Minutes parser for “1h 30m”, “2h”, “90m”, etc.
   const toMinutes = (label) => {
     const s = String(label || '').replace(/\u00a0/g, ' ').toLowerCase().trim();
     let m;
@@ -601,50 +663,9 @@ app.get('/price', async (req, res) => {
     return null;
   };
 
-  // Find the popup that contains the requested start time in its header
-  async function pickPopupByStart(page, startHH, timeoutMs = 7000) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const popups = page.locator('div:has(button:has-text("Continue"))');
-      const count = await popups.count().catch(() => 0);
-      for (let i = 0; i < count; i++) {
-        const p = popups.nth(i);
-        try { await p.waitFor({ state: 'visible', timeout: 300 }); } catch {}
-        const headerTime = await p
-          .locator('.flex.flex-row.justify-between.font-bold div')
-          .nth(1)
-          .textContent()
-          .then(t => (t || '').replace(/\u00a0/g, ' ').trim())
-          .catch(() => null);
-        if (headerTime && headerTime.includes(startHH)) return p;
-      }
-      await page.waitForTimeout(150);
-    }
-    return null;
-  }
-
-  // Read all duration rows (left label = duration, right = price) from a specific popup element
-  async function readRowsFromPopup(popup) {
-    return await popup.evaluate((root) => {
-      const norm = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
-      const rows = [];
-      const nodes = root.querySelectorAll('div');
-      for (const el of nodes) {
-        if (el.children && el.children.length === 2 &&
-            el.children[0].tagName === 'DIV' && el.children[1].tagName === 'DIV') {
-          const left  = norm(el.children[0].textContent || '');
-          const right = norm(el.children[1].textContent || '');
-          const looksLikeDuration = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
-          const looksLikeMoney    = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
-          if (looksLikeDuration && looksLikeMoney) rows.push([left, right]);
-        }
-      }
-      // header time (for debug)
-      const headerEl = root.querySelector('.flex.flex-row.justify-between.font-bold div:last-child');
-      const headerTime = norm(headerEl?.textContent || '');
-      return { headerTime, rows };
-    });
-  }
+  // Hard overall guard so the route can’t hang forever
+  const HARD_DEADLINE_MS = 15000;
+  const hardDeadline = Date.now() + HARD_DEADLINE_MS;
 
   let context, page;
   const debug = {
@@ -652,8 +673,9 @@ app.get('/price', async (req, res) => {
     url: `${BASE}/clubs/${encodeURIComponent(slug)}`,
     steps: [],
     clicked: false,
+    courtName: null,
     popupWhy: null,
-    headerTime: null,
+    popupHeader: null,
     popupDurations: [],
     chosen: null
   };
@@ -662,7 +684,7 @@ app.get('/price', async (req, res) => {
     context = await newContext();
     page = await context.newPage();
 
-    // block trackers for speed
+    // Trim trackers for speed
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -673,19 +695,25 @@ app.get('/price', async (req, res) => {
       route.continue();
     });
 
-    // nav + hydrate
-    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector('#__next', { timeout: 30000 }).catch(() => {});
+    // Navigate + hydrate (abort if hard timeout passes)
+    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_nav');
+    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: Math.max(1, hardDeadline - Date.now()) });
+    await page.waitForSelector('#__next', { timeout: Math.max(1, hardDeadline - Date.now()) }).catch(() => {});
     await autoDismissConsent(page).catch(() => {});
     await page.evaluate(() => window.scrollTo(0, 0)).catch(()=>{});
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
-    // date → grid
+    // Date → grid
+    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_date');
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // click exact slot (strict resourceId + start + end)
+    // For extra anchoring: read the court name for this resource
+    debug.courtName = await getCourtNameForResource(page, resourceId);
+
+    // Click the exact block (bounded inside helper)
+    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_click');
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = !!(clickRes && clickRes.clicked);
     debug.steps.push(`clicked_${debug.clicked ? 'ok' : 'fail'}`);
@@ -701,10 +729,11 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // anchor the correct popup by header time that includes startHH
-    const popup = await pickPopupByStart(page, startHH, 7000);
-    if (!popup) {
-      debug.popupWhy = 'popup_not_found_for_start';
+    // Anchor the *correct* popup by header time + (if known) court name
+    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_popup');
+    const picked = await pickPopupByStartAndName(page, startHH, debug.courtName, Math.max(500, hardDeadline - Date.now()));
+    if (!picked) {
+      debug.popupWhy = 'popup_not_found_for_start_and_name';
       return res.json({
         slug, date, resourceId,
         startTime: startHH,
@@ -713,11 +742,12 @@ app.get('/price', async (req, res) => {
         debug
       });
     }
+    debug.popupHeader = { leftName: picked.leftName, rightTime: picked.rightTime };
 
-    const info = await readRowsFromPopup(popup);
-    debug.headerTime = info.headerTime || null;
-
-    if (!info.rows || info.rows.length === 0) {
+    // Read rows (duration → price) strictly from that popup
+    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_readrows');
+    const rows = await readRowsFromPopup(picked.popup);
+    if (!rows || rows.length === 0) {
       debug.popupWhy = 'rows_not_found';
       return res.json({
         slug, date, resourceId,
@@ -728,15 +758,14 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // Build duration->price map and pick targetDur
     const priceByMin = new Map();
-    for (const [label, money] of info.rows) {
+    for (const [label, price] of rows) {
       const mins = toMinutes(label);
-      if (mins != null && !priceByMin.has(mins)) priceByMin.set(mins, money);
+      if (mins != null && !priceByMin.has(mins)) priceByMin.set(mins, price);
     }
     debug.popupDurations = Array.from(priceByMin.keys()).sort((a,b)=>a-b);
 
-    const chosen = priceByMin.get(targetDur) || null;
+    const chosen = priceByMin.get(duration) || null;
     debug.chosen = chosen;
 
     return res.json({
@@ -746,14 +775,15 @@ app.get('/price', async (req, res) => {
       price: chosen || '? EUR',
       debug
     });
+
   } catch (e) {
-    return res.status(500).json({ error: 'price failed', detail: String(e), debug });
+    const msg = String(e && e.message || e);
+    return res.status(500).json({ error: 'price failed', detail: msg, debug });
   } finally {
     try { await page?.close(); } catch {}
     try { await context?.close(); } catch {}
   }
 });
-
 
 
 
@@ -982,62 +1012,20 @@ async function readPriceFromDOM(page, timeoutMs = 4500) {
 }
 
 
-// Find and click a specific slot block in the grid (by resourceId + startHH [+ endHH])
-async function findAndClickSlot(page, resourceId, startHH, endHH, timeoutMs = 7000) {
-  // Some grids use unpadded hour like "0:30". Build selector variants.
-  const toVariants = (hhmm) => {
-    if (!hhmm) return [];
-    const [H, M] = hhmm.split(':');
-    const hNum = String(parseInt(H, 10));
-    const v1 = `${H.padStart(2,'0')}:${M}`;
-    const v2 = `${hNum}:${M}`;
-    return Array.from(new Set([v1, v2]));
-  };
+// Click a specific slot strictly by resourceId + start + end, with bounded sweeps.
+async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 18) {
+  const selector = `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"][data-end-hour="${endHH}"]`;
 
-  const startVars = toVariants(startHH);
-  const endVars   = endHH ? toVariants(endHH) : [];
-
-  const selectors = [];
-  // exact start+end first (both padded and unpadded)
-  if (endVars.length) {
-    for (const s of startVars) for (const e of endVars) {
-      selectors.push(`div[data-court-id="${resourceId}"][data-start-hour="${s}"][data-end-hour="${e}"]`);
-    }
-  }
-  // then start-only fallback
-  for (const s of startVars) {
-    selectors.push(`div[data-court-id="${resourceId}"][data-start-hour="${s}"]`);
+  // Try current viewport first
+  let el = await page.locator(selector).first();
+  if (await el.count()) {
+    try { await el.scrollIntoViewIfNeeded(); } catch {}
+    try { await el.click({ force: true, delay: 15 }); return { clicked: true, where: 'initial' }; } catch {}
   }
 
-  // Try to keep the row in view for virtualization-heavy pages
-  const row = page.locator(`div.flex.border-b.ui-stroke-neutral-default:has(div[data-court-id="${resourceId}"])`).first();
-  try { await row.waitFor({ timeout: 2500 }); } catch {}
-  if (await row.count()) {
-    try { await row.scrollIntoViewIfNeeded(); } catch {}
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    for (const sel of selectors) {
-      const target = page.locator(sel).first();
-      if (await target.count()) {
-        try { await target.scrollIntoViewIfNeeded(); } catch {}
-        const hit = target.locator('div.absolute').first();
-        try {
-          if (await hit.count()) await hit.click({ force: true });
-          else await target.click({ force: true });
-        } catch {
-          // one retry after a tiny delay
-          await page.waitForTimeout(120);
-          try { await target.click({ force: true }); } catch {}
-        }
-        // small settle + optimistic wait for any popup content
-        await page.waitForTimeout(180);
-        return { clicked: true };
-      }
-    }
-    // nudge scroll a bit and retry
-    await page.evaluate(() => {
+  // Otherwise sweep the scrollable grid downwards a fixed number of times
+  for (let i = 0; i < maxSweeps; i++) {
+    const pos = await page.evaluate(() => {
       const first = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
       const getScrollableParent = (el) => {
         let p = el && el.parentElement;
@@ -1049,12 +1037,34 @@ async function findAndClickSlot(page, resourceId, startHH, endHH, timeoutMs = 70
         return null;
       };
       const sc = first && getScrollableParent(first);
-      if (sc) sc.scrollTop = Math.min(sc.scrollTop + Math.floor(sc.clientHeight * 0.85), sc.scrollHeight);
-    }).catch(()=>{});
-    await page.waitForTimeout(140);
-  }
+      const delta = Math.floor((sc ? sc.clientHeight : window.innerHeight) * 0.9);
 
-  return { clicked: false, reason: 'slot_not_found' };
+      let before, after, max;
+      if (sc) {
+        before = sc.scrollTop;
+        sc.scrollTop = Math.min(sc.scrollHeight, sc.scrollTop + delta);
+        after = sc.scrollTop;
+        max = sc.scrollHeight - sc.clientHeight - 1;
+      } else {
+        before = window.scrollY;
+        window.scrollTo(0, window.scrollY + delta);
+        after = window.scrollY;
+        max = document.documentElement.scrollHeight - window.innerHeight - 1;
+      }
+      return { before, after, max };
+    }).catch(() => ({ before: 0, after: 0, max: 0 }));
+
+    await page.waitForTimeout(120);
+
+    el = await page.locator(selector).first();
+    if (await el.count()) {
+      try { await el.scrollIntoViewIfNeeded(); } catch {}
+      try { await el.click({ force: true, delay: 15 }); return { clicked: true, where: `sweep_${i+1}` }; } catch {}
+    }
+
+    if (pos.after === pos.before || pos.after >= pos.max) break; // hit end
+  }
+  return { clicked: false };
 }
 
 
@@ -1540,6 +1550,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
