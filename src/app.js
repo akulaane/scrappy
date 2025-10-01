@@ -708,6 +708,7 @@ app.get('/price', async (req, res) => {
     if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_date');
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
+     await scrollGridToTop(page);
 
     // For extra anchoring: read the court name for this resource
     debug.courtName = await getCourtNameForResource(page, resourceId);
@@ -808,6 +809,29 @@ function hhVariants(hhmm) {
   const v2 = `${String(H).padStart(2,'0')}:${M}`;
   return [...new Set([v1, v2])];
 }
+
+async function scrollGridToTop(page) {
+  try {
+    await page.evaluate(() => {
+      const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+      const getScrollableParent = (el) => {
+        let p = el && el.parentElement;
+        while (p) {
+          const cs = getComputedStyle(p);
+          if (/(auto|scroll)/.test(cs.overflowY)) return p;
+          p = p.parentElement;
+        }
+        return null;
+      };
+      const sc = sample && getScrollableParent(sample);
+      if (sc) sc.scrollTop = 0;
+      window.scrollTo(0, 0);
+    });
+  } catch {}
+}
+
+
+
 
 // Find the scrollable container for the grid
 async function getGridScroller(page) {
@@ -1012,21 +1036,45 @@ async function readPriceFromDOM(page, timeoutMs = 4500) {
 }
 
 
-// Click a specific slot strictly by resourceId + start + end, with bounded sweeps.
-async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 18) {
-  const selector = `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"][data-end-hour="${endHH}"]`;
 
-  // Try current viewport first
-  let el = await page.locator(selector).first();
-  if (await el.count()) {
-    try { await el.scrollIntoViewIfNeeded(); } catch {}
-    try { await el.click({ force: true, delay: 15 }); return { clicked: true, where: 'initial' }; } catch {}
+// Click a specific slot by resourceId + start + end, tolerant of "H:MM" vs "HH:MM".
+async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 24) {
+  function norm(hhmm) {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || ''));
+    if (!m) return null;
+    return `${parseInt(m[1], 10)}:${m[2]}`; // strip any leading zero on hours
+  }
+  const wantStart = norm(startHH);
+  const wantEnd   = norm(endHH);
+
+  async function tryClickOnce() {
+    return await page.evaluate(({ rid, s, e }) => {
+      function norm2(x) {
+        const m = /^(\d{1,2}):(\d{2})$/.exec(String(x || ''));
+        if (!m) return null;
+        return `${parseInt(m[1], 10)}:${m[2]}`;
+      }
+      const nodes = document.querySelectorAll('div[data-court-id][data-start-hour][data-end-hour]');
+      for (const el of nodes) {
+        if (el.getAttribute('data-court-id') !== rid) continue;
+        const st = norm2(el.getAttribute('data-start-hour'));
+        const en = norm2(el.getAttribute('data-end-hour'));
+        if (st === s && en === e) {
+          try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+          try { el.click(); return true; } catch {}
+        }
+      }
+      return false;
+    }, { rid: resourceId, s: wantStart, e: wantEnd });
   }
 
-  // Otherwise sweep the scrollable grid downwards a fixed number of times
+  // Try current viewport first
+  if (await tryClickOnce()) return { clicked: true, where: 'initial' };
+
+  // Bounded downward sweeps through the scroll container
   for (let i = 0; i < maxSweeps; i++) {
-    const pos = await page.evaluate(() => {
-      const first = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+    const moved = await page.evaluate(() => {
+      const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
       const getScrollableParent = (el) => {
         let p = el && el.parentElement;
         while (p) {
@@ -1036,34 +1084,24 @@ async function findAndClickSlot(page, resourceId, startHH, endHH, maxSweeps = 18
         }
         return null;
       };
-      const sc = first && getScrollableParent(first);
-      const delta = Math.floor((sc ? sc.clientHeight : window.innerHeight) * 0.9);
-
-      let before, after, max;
+      const sc = sample && getScrollableParent(sample);
       if (sc) {
-        before = sc.scrollTop;
-        sc.scrollTop = Math.min(sc.scrollHeight, sc.scrollTop + delta);
-        after = sc.scrollTop;
-        max = sc.scrollHeight - sc.clientHeight - 1;
+        const before = sc.scrollTop;
+        const delta = Math.floor(sc.clientHeight * 0.9);
+        sc.scrollTop = Math.min(sc.scrollHeight, before + delta);
+        return sc.scrollTop !== before;
       } else {
-        before = window.scrollY;
-        window.scrollTo(0, window.scrollY + delta);
-        after = window.scrollY;
-        max = document.documentElement.scrollHeight - window.innerHeight - 1;
+        const before = window.scrollY;
+        window.scrollTo(0, before + Math.floor(window.innerHeight * 0.9));
+        return window.scrollY !== before;
       }
-      return { before, after, max };
-    }).catch(() => ({ before: 0, after: 0, max: 0 }));
+    }).catch(() => false);
 
     await page.waitForTimeout(120);
-
-    el = await page.locator(selector).first();
-    if (await el.count()) {
-      try { await el.scrollIntoViewIfNeeded(); } catch {}
-      try { await el.click({ force: true, delay: 15 }); return { clicked: true, where: `sweep_${i+1}` }; } catch {}
-    }
-
-    if (pos.after === pos.before || pos.after >= pos.max) break; // hit end
+    if (await tryClickOnce()) return { clicked: true, where: `sweep_${i + 1}` };
+    if (!moved) break; // reached the end
   }
+
   return { clicked: false };
 }
 
@@ -1550,6 +1588,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
