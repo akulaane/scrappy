@@ -538,9 +538,8 @@ perClubItems.push({
   }
 });
 
-
 /* =========================
-   Single-slot price verifier
+   Single-slot price verifier (popup-anchored)
    ========================= */
 
 // GET /price
@@ -563,17 +562,36 @@ app.get('/price', async (req, res) => {
 
   const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
   const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
+  const minDiff = (a,b) => ((b - a + 1440) % 1440);
 
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
+
+  // If both end & duration provided but conflict, prefer duration (and recompute end).
+  if (endHH && duration) {
+    const inferred = minDiff(hmToMin(startHH), hmToMin(endHH));
+    if (Math.abs(inferred - duration) >= 5) {
+      endHH = minToHHMM(hmToMin(startHH) + duration);
+    }
+  }
+
+  // Derive the missing piece
   if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
-  if (!duration && endHH) duration = ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
+  if (!duration && endHH) duration = minDiff(hmToMin(startHH), hmToMin(endHH));
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
 
-  // --- Helper: parse "1h 30m" / "1h" / "90 m" into minutes ---
+  // Normalize duration to expected buckets if slightly off (DST etc.)
+  const allowed = [60, 90, 120];
+  let targetDur = duration;
+  if (!allowed.includes(targetDur)) {
+    targetDur = allowed.reduce((best, v) =>
+      Math.abs(v - targetDur) < Math.abs(best - targetDur) ? v : best, allowed[0]);
+  }
+
+  // Helpers for popup scraping
   const toMinutes = (label) => {
     const s = String(label || '').replace(/\u00a0/g, ' ').toLowerCase().trim();
     let m;
@@ -583,49 +601,49 @@ app.get('/price', async (req, res) => {
     return null;
   };
 
-  // --- Helper: read rows from the open popup containing the Continue button ---
-  async function readPopupRows(page, startHH, timeoutMs = 7000) {
+  // Find the popup that contains the requested start time in its header
+  async function pickPopupByStart(page, startHH, timeoutMs = 7000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      // NOTE: do NOT require direct child – the Continue button is nested.
-      const popup = page.locator('div:has(button:has-text("Continue"))').last();
-      if (await popup.count().catch(() => 0)) {
-        await popup.waitFor({ state: 'visible', timeout: 1200 }).catch(() => {});
-        await page.waitForTimeout(100).catch(()=>{});
-
-        // Only look within THIS popup element.
-        const info = await popup.evaluate((root, startHH) => {
-          const norm = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
-
-          // Sanity: ensure the popup text includes the chosen start time (e.g. "21:30")
-          const fullText = norm(root.innerText || '');
-          const hasStart = fullText.includes(startHH);
-
-          // Collect any descendants that look like "duration | price" with exactly two direct DIVs.
-          const rows = [];
-          const nodes = root.querySelectorAll('div');
-          for (const el of nodes) {
-            const kids = el.children;
-            if (kids.length !== 2) continue;
-            if (kids[0].tagName !== 'DIV' || kids[1].tagName !== 'DIV') continue;
-
-            const left  = norm(kids[0].textContent || '');
-            const right = norm(kids[1].textContent || '');
-
-            const looksLikeDuration = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
-            const looksLikeMoney    = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
-            if (looksLikeDuration && looksLikeMoney) rows.push([left, right]);
-          }
-          return { hasStart, rows };
-        }, startHH);
-
-        if (info?.rows?.length) {
-          return { ok: true, rows: info.rows, hasStart: !!info.hasStart };
-        }
+      const popups = page.locator('div:has(button:has-text("Continue"))');
+      const count = await popups.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const p = popups.nth(i);
+        try { await p.waitFor({ state: 'visible', timeout: 300 }); } catch {}
+        const headerTime = await p
+          .locator('.flex.flex-row.justify-between.font-bold div')
+          .nth(1)
+          .textContent()
+          .then(t => (t || '').replace(/\u00a0/g, ' ').trim())
+          .catch(() => null);
+        if (headerTime && headerTime.includes(startHH)) return p;
       }
       await page.waitForTimeout(150);
     }
-    return { ok: false, rows: [] };
+    return null;
+  }
+
+  // Read all duration rows (left label = duration, right = price) from a specific popup element
+  async function readRowsFromPopup(popup) {
+    return await popup.evaluate((root) => {
+      const norm = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      const rows = [];
+      const nodes = root.querySelectorAll('div');
+      for (const el of nodes) {
+        if (el.children && el.children.length === 2 &&
+            el.children[0].tagName === 'DIV' && el.children[1].tagName === 'DIV') {
+          const left  = norm(el.children[0].textContent || '');
+          const right = norm(el.children[1].textContent || '');
+          const looksLikeDuration = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
+          const looksLikeMoney    = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
+          if (looksLikeDuration && looksLikeMoney) rows.push([left, right]);
+        }
+      }
+      // header time (for debug)
+      const headerEl = root.querySelector('.flex.flex-row.justify-between.font-bold div:last-child');
+      const headerTime = norm(headerEl?.textContent || '');
+      return { headerTime, rows };
+    });
   }
 
   let context, page;
@@ -635,15 +653,16 @@ app.get('/price', async (req, res) => {
     steps: [],
     clicked: false,
     popupWhy: null,
+    headerTime: null,
     popupDurations: [],
-    price: null
+    chosen: null
   };
 
   try {
     context = await newContext();
     page = await context.newPage();
 
-    // trim trackers for speed
+    // block trackers for speed
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -662,11 +681,11 @@ app.get('/price', async (req, res) => {
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
-    // date → UI grid
+    // date → grid
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // click the exact slot
+    // click exact slot (strict resourceId + start + end)
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = !!(clickRes && clickRes.clicked);
     debug.steps.push(`clicked_${debug.clicked ? 'ok' : 'fail'}`);
@@ -682,9 +701,23 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // read the popup rows and pick the requested duration
-    const got = await readPopupRows(page, startHH, 7000);
-    if (!got.ok) {
+    // anchor the correct popup by header time that includes startHH
+    const popup = await pickPopupByStart(page, startHH, 7000);
+    if (!popup) {
+      debug.popupWhy = 'popup_not_found_for_start';
+      return res.json({
+        slug, date, resourceId,
+        startTime: startHH,
+        endTime: endHH,
+        price: '? EUR',
+        debug
+      });
+    }
+
+    const info = await readRowsFromPopup(popup);
+    debug.headerTime = info.headerTime || null;
+
+    if (!info.rows || info.rows.length === 0) {
       debug.popupWhy = 'rows_not_found';
       return res.json({
         slug, date, resourceId,
@@ -695,16 +728,16 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // duration→price map from the rows
+    // Build duration->price map and pick targetDur
     const priceByMin = new Map();
-    for (const [label, money] of got.rows) {
+    for (const [label, money] of info.rows) {
       const mins = toMinutes(label);
       if (mins != null && !priceByMin.has(mins)) priceByMin.set(mins, money);
     }
     debug.popupDurations = Array.from(priceByMin.keys()).sort((a,b)=>a-b);
 
-    const chosen = priceByMin.get(duration) || null;
-    debug.price = chosen;
+    const chosen = priceByMin.get(targetDur) || null;
+    debug.chosen = chosen;
 
     return res.json({
       slug, date, resourceId,
@@ -720,6 +753,8 @@ app.get('/price', async (req, res) => {
     try { await context?.close(); } catch {}
   }
 });
+
+
 
 
 /* =========================
@@ -1505,6 +1540,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
