@@ -537,6 +537,7 @@ perClubItems.push({
     try { await context?.close(); } catch {}
   }
 });
+
 /* =========================
    Single-slot price verifier
    ========================= */
@@ -573,12 +574,26 @@ app.get('/price', async (req, res) => {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
 
-  // --- helpers local to this route ---
-  const readPopupDurationMap = async (page, timeoutMs = 4500) => {
-    // Wait for the popup to appear (the Continue button is a stable anchor)
-    await page.waitForSelector('button:has-text("Continue")', { timeout: timeoutMs }).catch(() => {});
-    // Grab rows that look like:  <div>1h 30m</div><div>36 EUR</div>
-    const pairs = await page.$$eval(
+  // helper: read price rows from the *correct* popup container
+  async function readDurationRowsFromPopup(page, expectCourtName, startHH, timeoutMs = 6000) {
+    // The popup header looks like: <div class="flex ... font-bold"><div>{CourtName}</div><div>{HH:MM}</div></div>
+    // We locate that header and then read rows inside its container only.
+    const header = page.locator('div.flex.flex-row.justify-between.font-bold');
+    const headerFiltered = expectCourtName
+      ? header.filter({ hasText: expectCourtName }).filter({ hasText: startHH })
+      : header.filter({ hasText: startHH });
+
+    try {
+      await headerFiltered.first().waitFor({ timeout: timeoutMs });
+    } catch {
+      return { map: new Map(), why: 'header_not_found' };
+    }
+
+    // container = header’s parent (the whole popup box)
+    const container = headerFiltered.first().locator('..');
+
+    // Each duration row: <div class="flex ... rounded-md border ..."><div>1h 30m</div><div>36 EUR</div></div>
+    const pairs = await container.$$eval(
       'div.flex.cursor-pointer.flex-row.justify-between.rounded-md.border',
       nodes => nodes.map(n => {
         const left  = (n.querySelector('div:first-child')?.textContent || '').trim();
@@ -594,70 +609,19 @@ app.get('/price', async (req, res) => {
       const mins = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
       if (right && /\d/.test(right)) map.set(mins, right);
     }
-    return map;
-  };
-
-  const fetchJsonPrice = async (page, date, resourceId, startHH, wantMins) => {
-    try {
-      const result = await page.evaluate(async (args) => {
-        const { date, resourceId, startHH, wantMins } = args;
-        const el = document.querySelector('script#__NEXT_DATA__');
-        let clubId = null;
-        try {
-          const data = el ? JSON.parse(el.textContent || '{}') : null;
-          const findUuid = (n) => {
-            if (!n || typeof n !== 'object') return null;
-            if (typeof n.id === 'string' &&
-                /^[0-9a-f-]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(n.id)) {
-              return n.id;
-            }
-            for (const v of Object.values(n)) {
-              const got = findUuid(v);
-              if (got) return got;
-            }
-            return null;
-          };
-          clubId = findUuid(data);
-        } catch {}
-
-        if (!clubId) return { price: null, why: 'no_club_id' };
-
-        const url = `/api/clubs/availability?clubId=${encodeURIComponent(clubId)}&date=${encodeURIComponent(date)}`;
-        const resp = await fetch(url, { credentials: 'same-origin' });
-        if (!resp.ok) return { price: null, why: 'resp_not_ok' };
-
-        const payload = await resp.json();
-        const arr = Array.isArray(payload) ? payload : [];
-
-        const startSS = `${startHH}:00`;
-        for (const entry of arr) {
-          if (!entry || entry.resource_id !== resourceId) continue;
-          const slots = Array.isArray(entry.slots) ? entry.slots : [];
-          for (const s of slots) {
-            if (String(s.start_time) === startSS && Number(s.duration) === Number(wantMins)) {
-              return { price: String(s.price || '').trim(), why: 'matched' };
-            }
-          }
-        }
-        return { price: null, why: 'no_match' };
-      }, { date, resourceId, startHH, wantMins });
-
-      return result?.price || null;
-    } catch {
-      return null;
-    }
-  };
+    return { map, why: 'ok' };
+  }
 
   let context, page;
   const debug = {
     slug, date, resourceId, startHH, endHH, duration,
     url: `${BASE}/clubs/${encodeURIComponent(slug)}`,
     steps: [],
-    clicked: null,
+    clicked: false,
+    courtName: null,
+    popupWhy: null,
     popupDurations: [],
-    domPrice: null,
-    jsonPrice: null,
-    source: null
+    price: null,
   };
 
   try {
@@ -687,41 +651,38 @@ app.get('/price', async (req, res) => {
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // click the slot on the grid
+    // get court name for this resource (so we can target the correct popup)
+    const meta = await collectCourtMeta(page);
+    debug.courtName = meta.courts?.[resourceId]?.courtName || null;
+
+    // click the slot on the grid (robust click inside the correct row)
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = !!(clickRes && clickRes.clicked);
+    debug.steps.push(`clicked_${debug.clicked ? 'ok' : 'fail'}`);
 
-    // If clicked, read all duration rows from the popup and pick the exact one
-    if (debug.clicked) {
-      const map = await readPopupDurationMap(page, 5000);
-      debug.popupDurations = Array.from(map.keys());  // e.g. [60,90,120]
-      const want = duration || ((hmToMin(endHH) - hmToMin(startHH) + 1440) % 1440);
-      const domPrice = map.get(want) || null;
-      debug.domPrice = domPrice;
-
-      if (domPrice) {
-        debug.source = 'popup';
-        return res.json({
-          slug, date, resourceId,
-          startTime: startHH,
-          endTime: endHH,
-          price: domPrice,
-          source: 'popup',
-          debug
-        });
-      }
+    if (!debug.clicked) {
+      return res.json({
+        slug, date, resourceId,
+        startTime: startHH,
+        endTime: endHH,
+        price: '? EUR',
+        debug
+      });
     }
 
-    // Fallback: use availability JSON for this date
-    debug.jsonPrice = await fetchJsonPrice(page, date, resourceId, startHH, duration);
-    debug.source = debug.jsonPrice ? 'json' : 'unknown';
+    // read all duration options from this popup, then pick exact duration
+    const { map, why } = await readDurationRowsFromPopup(page, debug.courtName, startHH, 6000);
+    debug.popupWhy = why;
+    debug.popupDurations = Array.from(map.keys()); // e.g. [60, 90, 120]
+
+    const chosen = map.get(duration) || null;
+    debug.price = chosen;
 
     return res.json({
       slug, date, resourceId,
       startTime: startHH,
       endTime: endHH,
-      price: debug.jsonPrice || '? EUR',
-      source: debug.source,
+      price: chosen || '? EUR',
       debug
     });
   } catch (e) {
@@ -958,30 +919,73 @@ async function readPriceFromDOM(page, timeoutMs = 4500) {
   return null;
 }
 
-async function findAndClickSlot(page, resourceId, startHH, endHH) {
-  // make sure the grid rendered
-  await sweepVirtualizedGrid(page).catch(()=>{});
+// Find and click a specific slot block in the grid (by resourceId + startHH [+ endHH])
+async function findAndClickSlot(page, resourceId, startHH, endHH, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
 
-  const exactSel = endHH
-    ? `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"][data-end-hour="${endHH}"] div.absolute`
-    : null;
+  // Try to locate the row containing this resourceId (this keeps scroll focused)
+  const row = page.locator(`div.flex.border-b.ui-stroke-neutral-default:has(div[data-court-id="${resourceId}"])`).first();
+  try { await row.waitFor({ timeout: 3000 }); } catch {}
 
-  const byStartSel = `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"] div.absolute`;
-
-  let target = null;
-  if (exactSel) {
-    const exact = page.locator(exactSel).first();
-    if (await exact.count()) target = exact;
+  if (await row.count()) {
+    try { await row.scrollIntoViewIfNeeded(); } catch {}
   }
-  if (!target) {
-    const byStart = page.locator(byStartSel).first();
-    if (await byStart.count()) target = byStart;
+
+  // Primary selector: exact start & end
+  const exact = page.locator(
+    `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"][data-end-hour="${endHH}"]`
+  ).first();
+
+  // Fallback: match by start only (if endHH variants exist)
+  const startOnly = page.locator(
+    `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"]`
+  ).first();
+
+  // choose which locator to try first
+  let target = exact;
+  if (!(await exact.count()) && (await startOnly.count())) target = startOnly;
+
+  // If neither exists yet (virtualized list?), sweep+retry a few times
+  for (let i = 0; i < 8; i++) {
+    if (await target.count()) break;
+    // nudge the scrollable container down a bit
+    await page.evaluate(() => {
+      const first = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+      const getScrollableParent = (el) => {
+        let p = el && el.parentElement;
+        while (p) {
+          const cs = getComputedStyle(p);
+          if (/(auto|scroll)/.test(cs.overflowY)) return p;
+          p = p.parentElement;
+        }
+        return null;
+      };
+      const sc = first && getScrollableParent(first);
+      if (sc) sc.scrollTop = Math.min(sc.scrollTop + Math.floor(sc.clientHeight * 0.8), sc.scrollHeight);
+    }).catch(()=>{});
+    await page.waitForTimeout(120);
   }
-  if (!target) return { clicked: false, endHH: endHH || null };
+
+  if (!(await target.count())) {
+    return { clicked: false, reason: 'slot_not_found' };
+  }
 
   try { await target.scrollIntoViewIfNeeded(); } catch {}
-  await target.click({ force: true, delay: 20 }).catch(()=>{});
-  return { clicked: true, endHH: endHH || null };
+  // Prefer clicking the absolute child (hit target), fallback to the block itself
+  const hit = target.locator('div.absolute').first();
+  if (await hit.count()) {
+    await hit.click({ force: true });
+  } else {
+    await target.click({ force: true });
+  }
+
+  await page.waitForTimeout(150); // small settle
+  // best-effort wait until a popup header appears (but don’t block forever)
+  try {
+    await page.locator('div.flex.flex-row.justify-between.font-bold').first().waitFor({ timeout: 1500 });
+  } catch {}
+
+  return { clicked: true };
 }
 
 
@@ -1466,6 +1470,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
