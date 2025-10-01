@@ -984,24 +984,6 @@ function formatDurationLabel(mins) {
   return `${h}h ${String(m).padStart(2,'0')}m`;
 }
 
-// Click a duration option in the modal
-async function selectDurationOption(page, minutes, timeoutMs = 4000) {
-  if (!minutes) return false;
-  const label = formatDurationLabel(minutes);
-  const end = Date.now() + timeoutMs;
-
-  while (Date.now() < end) {
-    const opt = page.getByRole('button', { name: new RegExp(`^\\s*${label}\\s*$`, 'i') }).first();
-    if (await opt.count()) {
-      try { await opt.scrollIntoViewIfNeeded(); } catch {}
-      await opt.click({ force: true, delay: 20 }).catch(()=>{});
-      await page.waitForTimeout(120);
-      return true;
-    }
-    await page.waitForTimeout(120);
-  }
-  return false;
-}
 
 // Read the price from the "Continue – XX EUR" button and let it settle
 async function readContinuePrice(page, settleMs = 350, timeoutMs = 5000) {
@@ -1672,6 +1654,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
