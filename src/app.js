@@ -538,10 +538,10 @@ perClubItems.push({
   }
 });
 
-
 /* =========================
-   Single-slot price verifier (popup anchored by time + court name)
+   Single-slot price verifier (tooltip anchored by time + court name)
    ========================= */
+
 app.get('/price', async (req, res) => {
   const BASE = 'https://playtomic.com';
 
@@ -552,28 +552,31 @@ app.get('/price', async (req, res) => {
   let   endHH      = normHHMM(String(req.query.end   || ''));
   let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
-  // small helpers (scoped to this route)
-  const hmToMin = (s) => { const [h,m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
+  // --- tiny helpers
+  const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
   const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
-  const minDiff = (a,b) => ((b - a + 1440) % 1440);
+  const diffMin = (a, b) => ((b - a + 1440) % 1440);
   const allowedDur = [60, 90, 120];
+  const HARD_DEADLINE_MS = 15000;
+  const hardDeadline = Date.now() + HARD_DEADLINE_MS;
 
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
     return res.status(400).json({ error: 'Bad or missing slug/date/resourceId/start' });
   }
 
-  // prefer duration when both are present but disagree
+  // prefer duration if both provided but disagree
   if (endHH && duration) {
-    const inferred = minDiff(hmToMin(startHH), hmToMin(endHH));
-    if (Math.abs(inferred - duration) >= 5) endHH = minToHHMM(hmToMin(startHH) + duration);
+    const inferred = diffMin(hmToMin(startHH), hmToMin(endHH));
+    if (Math.abs(inferred - duration) >= 5) {
+      endHH = minToHHMM(hmToMin(startHH) + duration);
+    }
   }
-  // derive the missing one
   if (!endHH && duration) endHH = minToHHMM(hmToMin(startHH) + duration);
-  if (!duration && endHH) duration = minDiff(hmToMin(startHH), hmToMin(endHH));
+  if (!duration && endHH) duration = diffMin(hmToMin(startHH), hmToMin(endHH));
   if (!endHH && !duration) {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
-  // snap to 60/90/120 if slightly off
+  // snap to 60/90/120 if a little off
   if (!allowedDur.includes(duration)) {
     duration = allowedDur.reduce((best, v) =>
       Math.abs(v - duration) < Math.abs(best - duration) ? v : best, allowedDur[0]);
@@ -596,7 +599,7 @@ app.get('/price', async (req, res) => {
     context = await newContext();
     page = await context.newPage();
 
-    // trim trackers
+    // trim trackers for speed
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -608,24 +611,29 @@ app.get('/price', async (req, res) => {
     });
 
     // nav + hydrate
-    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector('#__next', { timeout: 30000 }).catch(() => {});
+    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_nav');
+    await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: Math.max(1, hardDeadline - Date.now()) });
+    await page.waitForSelector('#__next', { timeout: Math.max(1, hardDeadline - Date.now()) }).catch(() => {});
     await autoDismissConsent(page).catch(() => {});
     await page.evaluate(() => window.scrollTo(0, 0)).catch(()=>{});
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
     // date → grid
+    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_date');
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
     await scrollGridToTop(page);
 
-    // click the exact block
-    const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
-    debug.clicked = clickRes.clicked;
-    debug.courtName = clickRes.courtName || debug.courtName || null;
+    // court name for better anchoring
+    debug.courtName = await getCourtNameForResource(page, resourceId);
 
-    if (!debug.clicked) {
+    // click slot & wait a beat for tooltip to appear
+    if (Date.now() > hardDeadline) throw new Error('hard_timeout_before_click');
+    const clicked = await clickSlotAndWaitTooltip(page, resourceId, startHH, endHH, 6000);
+    debug.clicked = clicked;
+
+    if (!clicked) {
       debug.popupWhy = 'not_clicked';
       return res.json({
         slug, date, resourceId,
@@ -637,13 +645,10 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // read popup (match header time + fuzzy court name)
-    const popup = await readPopupDurations(page, debug.courtName, startHH, 3500);
-    if (!popup) {
+    // read tooltip rows (prefer exact court name + start time)
+    const tip = await readTooltipRows(page, debug.courtName, startHH, 4000);
+    if (!tip) {
       debug.popupWhy = 'popup_not_found_for_start_and_name';
-      debug.popupHeader = null;
-      debug.popupDurations = [];
-      debug.chosen = null;
       return res.json({
         slug, date, resourceId,
         startTime: startHH,
@@ -654,19 +659,24 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    debug.popupWhy = 'ok';
-    debug.popupHeader = { name: popup.name, time: popup.time };
-    debug.popupDurations = popup.rows;
+    debug.popupWhy     = 'ok';
+    debug.popupHeader  = { name: tip.name, time: tip.time };
+    debug.popupDurations = tip.rows;
 
-    const chosen = (popup.rows || []).find(r => r.minutes === duration) || null;
+    // pick exact duration row
+    const chosen = (tip.rows || []).find(r => r.minutes === duration) || null;
     debug.chosen = chosen;
+
+    // LAST RESORT: if no exact row (should be rare), try the visible “Continue – …” text
+    let finalPrice = chosen?.price || null;
+    if (!finalPrice) finalPrice = await readContinuePrice(page, 2000);
 
     return res.json({
       slug, date, resourceId,
       startTime: startHH,
       endTime: endHH,
-      price: chosen ? chosen.price : '? EUR',
-      source: 'popup',
+      price: finalPrice || '? EUR',
+      source: chosen ? 'popup_row' : (finalPrice ? 'continue_btn' : 'popup'),
       debug
     });
 
@@ -701,6 +711,168 @@ function hhVariants(hhmm) {
   const v1 = `${H}:${M}`;
   const v2 = `${String(H).padStart(2,'0')}:${M}`;
   return [...new Set([v1, v2])];
+}
+
+// Duration → visible label (60 -> "1h 00m", etc.) – only used if you keep selectDurationOption
+function formatDurationLabel(mins) {
+  const h = Math.floor((mins|0) / 60);
+  const m = (mins|0) % 60;
+  return `${h}h ${String(m).padStart(2,'0')}m`;
+}
+
+// Read the "Continue – XX EUR" button text (fallback only)
+async function readContinuePrice(page, timeoutMs = 2000) {
+  const start = Date.now();
+  const moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
+
+  while (Date.now() - start < timeoutMs) {
+    const btn = page.getByRole('button', { name: /continue/i }).first();
+    if (await btn.count()) {
+      const txt = (await btn.textContent()) || '';
+      const m = txt.match(moneyRe);
+      if (m) return m[0].replace(/\s+/g, ' ').trim();
+    }
+    await page.waitForTimeout(150);
+  }
+  return null;
+}
+
+
+// Read the tooltip that matches (courtName?, start time) and return duration rows
+async function readTooltipRows(page, expectCourt, expectStart, timeoutMs = 4000) {
+  const toHMM = (s) => {
+    const m = /(\d{1,2}):(\d{2})/.exec(String(s || ''));
+    return m ? `${parseInt(m[1], 10)}:${m[2]}` : null;
+  };
+  const norm = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const normName = (s) => norm(s).toLowerCase();
+
+  const wantTime = toHMM(expectStart);
+  const wantName = expectCourt ? normName(expectCourt) : null;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    // Candidate containers: absolute tooltip with a Continue button inside
+    const containers = page.locator('div.absolute').filter({
+      has: page.getByRole('button', { name: /continue/i })
+    });
+
+    const count = await containers.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const c = containers.nth(i);
+
+      // header: two child DIVs (name | time). First try the .font-bold row; otherwise any 2-div row with a time on the right
+      let header = c.locator('.flex.flex-row.justify-between.font-bold').first();
+      if (!(await header.count())) {
+        header = c.locator('div').filter({
+          has: page.locator('div:nth-child(2):has-text(":")')
+        }).first();
+      }
+
+      if (!(await header.count())) continue;
+
+      const hKids = header.locator('div');
+      const nameText = norm(await hKids.nth(0).innerText().catch(()=>''));  // e.g. "7# NeuroVIZR 2vs2"
+      const timeText = toHMM(await hKids.nth(1).innerText().catch(()=>'')); // e.g. "21:30"
+      if (!timeText) continue;
+
+      const nameOk = !wantName || normName(nameText).includes(wantName) || wantName.includes(normName(nameText));
+      const timeOk = !wantTime || wantTime === timeText;
+      if (!(nameOk && timeOk)) continue;
+
+      // rows: prefer the “flex cursor-pointer … justify-between” ones,
+      // fallback to any 2-div row where left looks like duration and right looks like money.
+      let rows = await c.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
+      if (!rows.length) rows = await c.locator('div').all().catch(()=>[]);
+
+      const parsed = [];
+      for (const r of rows) {
+        const kids = r.locator('div');
+        if ((await kids.count()) !== 2) continue;
+        const left  = norm(await kids.nth(0).innerText().catch(()=>'')); // "1h 30m"
+        const right = norm(await kids.nth(1).innerText().catch(()=>'')); // "54 EUR"
+        const looksDur   = /(\d+\s*h\s*\d{1,2}\s*m)|(\d+\s*h)|(\d{1,3}\s*m)/i.test(left);
+        const looksMoney = (/\d/.test(right) && /(EUR|€|USD|\$|GBP|£|kr)/i.test(right));
+        if (!(looksDur && looksMoney)) continue;
+
+        // to minutes
+        let minutes = null, m;
+        const s = left.toLowerCase();
+        if ((m = s.match(/(\d+)\s*h\s*(\d{1,2})\s*m/))) minutes = (+m[1]) * 60 + (+m[2]);
+        else if ((m = s.match(/(\d+)\s*h(?![a-z])/)))  minutes = (+m[1]) * 60;
+        else if ((m = s.match(/(\d{1,3})\s*m/)))       minutes = (+m[1]);
+
+        if (minutes) parsed.push({ label: left, minutes, price: right });
+      }
+
+      if (parsed.length) {
+        return { name: nameText, time: timeText, rows: parsed };
+      }
+    }
+
+    await page.waitForTimeout(120);
+  }
+
+  return null;
+}
+
+
+
+
+
+// Click slot and wait for the tooltip to actually exist
+async function clickSlotAndWaitTooltip(page, resourceId, startHH, endHH, timeoutMs = 6000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const loc = await findSlotLocator(page, resourceId, startHH, endHH);
+    if (loc) {
+      try { await loc.scrollIntoViewIfNeeded(); } catch {}
+      const box = await loc.boundingBox().catch(() => null);
+      if (box) {
+        await page.mouse.click(box.x + box.width/2, box.y + Math.min(box.height/2, 8), { delay: 20 });
+      } else {
+        await loc.click({ force: true }).catch(()=>{});
+      }
+      // wait for any visible "tooltip-like" container that has a "Continue" button
+      const tip = page.locator('div.absolute').filter({ has: page.getByRole('button', { name: /continue/i }) });
+      if (await tip.first().isVisible().catch(()=>false)) return true;
+    }
+
+    // nudge virtualization forward
+    await page.evaluate(() => {
+      const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+      const getScrollableParent = (el) => {
+        let p = el && el.parentElement;
+        while (p) {
+          const cs = getComputedStyle(p);
+          if (/(auto|scroll)/.test(cs.overflowY)) return p;
+          p = p.parentElement;
+        }
+        return null;
+      };
+      const sc = sample && getScrollableParent(sample);
+      if (sc) sc.scrollTop = Math.min(sc.scrollHeight, sc.scrollTop + Math.floor(sc.clientHeight * 0.9));
+      else window.scrollTo(0, window.scrollY + Math.floor(window.innerHeight * 0.9));
+    }).catch(()=>{});
+
+    await page.waitForTimeout(120);
+  }
+  return false;
+}
+
+
+
+// Read court name for a resource id (from the left label of its row)
+async function getCourtNameForResource(page, rid) {
+  try {
+    return await page.evaluate((resourceId) => {
+      const block = document.querySelector(`div[data-court-id="${resourceId}"]`);
+      if (!block) return null;
+      const row = block.closest('div.flex.border-b');
+      const name = row?.querySelector('.truncate')?.textContent || '';
+      return name.trim() || null;
+    }, rid);
+  } catch { return null; }
 }
 
 // Read the visible popup for the clicked slot.
@@ -795,6 +967,7 @@ async function readPopupDurations(page, expectCourt, expectStart, timeoutMs = 35
 }
 
 
+// Scroll grid to top so the row is likely rendered
 async function scrollGridToTop(page) {
   try {
     await page.evaluate(() => {
@@ -814,6 +987,36 @@ async function scrollGridToTop(page) {
     });
   } catch {}
 }
+
+// Find the clickable element of a slot (prefer inner absolute block)
+async function findSlotLocator(page, resourceId, startHH, endHH) {
+  const hhVariants = (hhmm) => {
+    const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return [String(hhmm || '')];
+    const H = parseInt(m[1], 10);
+    const M = m[2];
+    const v1 = `${H}:${M}`;
+    const v2 = `${String(H).padStart(2,'0')}:${M}`;
+    return [...new Set([v1, v2])];
+  };
+  const starts = hhVariants(startHH);
+  const ends   = endHH ? hhVariants(endHH) : [null];
+
+  for (const s of starts) {
+    for (const e of ends) {
+      let base = page.locator(`div[data-court-id="${resourceId}"][data-start-hour="${s}"]`);
+      if (e) base = base.filter({ has: page.locator(`[data-end-hour="${e}"]`) });
+      if (await base.count()) {
+        const abs = base.locator('xpath=.//div[contains(@class,"absolute")]').first();
+        if (await abs.count()) return abs;
+        return base.first();
+      }
+    }
+  }
+  return null;
+}
+
+
 
 
 
@@ -1360,6 +1563,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
