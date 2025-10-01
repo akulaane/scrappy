@@ -538,6 +538,7 @@ perClubItems.push({
   }
 });
 
+
 /* =========================
    Single-slot price verifier
    ========================= */
@@ -574,42 +575,71 @@ app.get('/price', async (req, res) => {
     return res.status(400).json({ error: 'Provide end=HH:MM or duration=minutes' });
   }
 
-  // helper: read price rows from the *correct* popup container
-  async function readDurationRowsFromPopup(page, expectCourtName, startHH, timeoutMs = 6000) {
-    // The popup header looks like: <div class="flex ... font-bold"><div>{CourtName}</div><div>{HH:MM}</div></div>
-    // We locate that header and then read rows inside its container only.
-    const header = page.locator('div.flex.flex-row.justify-between.font-bold');
-    const headerFiltered = expectCourtName
-      ? header.filter({ hasText: expectCourtName }).filter({ hasText: startHH })
-      : header.filter({ hasText: startHH });
+  // Robust popup reader: ignore classes, rely on text structure.
+  async function readPopupDurations(page, startHH, courtNameOpt, timeoutMs = 6500) {
+    // wait a bit for popup to mount
+    try { await page.waitForTimeout(120); } catch {}
 
-    try {
-      await headerFiltered.first().waitFor({ timeout: timeoutMs });
-    } catch {
-      return { map: new Map(), why: 'header_not_found' };
+    // Try repeatedly for up to timeoutMs
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const data = await page.evaluate(({ startHH, courtNameOpt }) => {
+        const out = { header: null, rows: [] };
+
+        // The last popup in DOM that contains the startHH and at least one "h mm" row
+        const candidates = Array.from(document.querySelectorAll('div'))
+          .filter(el => {
+            const t = (el.textContent || '').trim();
+            if (!t || !t.includes(startHH)) return false;
+            return /\b\d+\s*h\s*\d{2}\s*m\b/i.test(t); // must contain duration-like text
+          });
+
+        if (!candidates.length) return out;
+
+        const box = candidates[candidates.length - 1]; // newest / topmost
+
+        // Try to infer header (court name + time in two sibling divs)
+        // pattern: <div><div>[Court]</div><div>[HH:MM]</div></div>
+        const blocks = Array.from(box.querySelectorAll('div'));
+        for (const b of blocks) {
+          const a = b.querySelector(':scope > div:nth-child(1)');
+          const c = b.querySelector(':scope > div:nth-child(2)');
+          if (a && c && c.textContent && c.textContent.trim() === startHH) {
+            out.header = (a.textContent || '').trim();
+            break;
+          }
+        }
+
+        // Collect duration rows inside this box.
+        // Each row typically has two direct div children: "1h 30m" | "36 EUR"
+        const rows = [];
+        blocks.forEach(d => {
+          const kids = d.querySelectorAll(':scope > div');
+          if (kids.length === 2) {
+            const left  = (kids[0].textContent || '').trim();
+            const right = (kids[1].textContent || '').trim();
+            if (/^\d+\s*h\s*\d{2}\s*m$/i.test(left) && /\d/.test(right)) {
+              rows.push([left, right]);
+            }
+          }
+        });
+
+        out.rows = rows;
+        return out;
+      }, { startHH, courtNameOpt });
+
+      if (data?.rows?.length) {
+        // Optionally filter by court name if provided and header present
+        if (courtNameOpt && data.header && !data.header.includes(courtNameOpt)) {
+          // header exists but doesn't match — keep trying briefly
+        } else {
+          return { ok: true, header: data.header || null, rows: data.rows };
+        }
+      }
+
+      await page.waitForTimeout(160);
     }
-
-    // container = header’s parent (the whole popup box)
-    const container = headerFiltered.first().locator('..');
-
-    // Each duration row: <div class="flex ... rounded-md border ..."><div>1h 30m</div><div>36 EUR</div></div>
-    const pairs = await container.$$eval(
-      'div.flex.cursor-pointer.flex-row.justify-between.rounded-md.border',
-      nodes => nodes.map(n => {
-        const left  = (n.querySelector('div:first-child')?.textContent || '').trim();
-        const right = (n.querySelector('div:last-child')?.textContent  || '').trim();
-        return { left, right };
-      })
-    ).catch(() => []);
-
-    const map = new Map(); // minutes -> "NN EUR"
-    for (const { left, right } of pairs) {
-      const m = left.match(/(\d+)\s*h\s*(\d{2})\s*m/i);
-      if (!m) continue;
-      const mins = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-      if (right && /\d/.test(right)) map.set(mins, right);
-    }
-    return { map, why: 'ok' };
+    return { ok: false, header: null, rows: [] };
   }
 
   let context, page;
@@ -621,7 +651,7 @@ app.get('/price', async (req, res) => {
     courtName: null,
     popupWhy: null,
     popupDurations: [],
-    price: null,
+    price: null
   };
 
   try {
@@ -651,16 +681,17 @@ app.get('/price', async (req, res) => {
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // get court name for this resource (so we can target the correct popup)
+    // court name (helps target the right popup; we won't hard-require it)
     const meta = await collectCourtMeta(page);
     debug.courtName = meta.courts?.[resourceId]?.courtName || null;
 
-    // click the slot on the grid (robust click inside the correct row)
+    // click the slot (now tolerant of unpadded H:MM times)
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = !!(clickRes && clickRes.clicked);
     debug.steps.push(`clicked_${debug.clicked ? 'ok' : 'fail'}`);
 
     if (!debug.clicked) {
+      debug.popupWhy = 'not_clicked';
       return res.json({
         slug, date, resourceId,
         startTime: startHH,
@@ -670,12 +701,32 @@ app.get('/price', async (req, res) => {
       });
     }
 
-    // read all duration options from this popup, then pick exact duration
-    const { map, why } = await readDurationRowsFromPopup(page, debug.courtName, startHH, 6000);
-    debug.popupWhy = why;
-    debug.popupDurations = Array.from(map.keys()); // e.g. [60, 90, 120]
+    // read durations directly from the visible popup (no button text dependency)
+    const pop = await readPopupDurations(page, startHH, debug.courtName, 6500);
+    if (!pop.ok) {
+      debug.popupWhy = 'header_or_rows_not_found';
+      return res.json({
+        slug, date, resourceId,
+        startTime: startHH,
+        endTime: endHH,
+        price: '? EUR',
+        debug
+      });
+    }
 
-    const chosen = map.get(duration) || null;
+    // map "1h 30m" → minutes, then pick requested duration
+    const toMin = (label) => {
+      const m = label.match(/(\d+)\s*h\s*(\d{2})\s*m/i);
+      if (!m) return null;
+      return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    };
+    const priceMap = new Map();
+    for (const [lbl, val] of pop.rows) {
+      const mins = toMin(lbl);
+      if (mins != null && !priceMap.has(mins)) priceMap.set(mins, val);
+    }
+    debug.popupDurations = Array.from(priceMap.keys());
+    const chosen = priceMap.get(duration) || null;
     debug.price = chosen;
 
     return res.json({
@@ -919,36 +970,62 @@ async function readPriceFromDOM(page, timeoutMs = 4500) {
   return null;
 }
 
+
 // Find and click a specific slot block in the grid (by resourceId + startHH [+ endHH])
-async function findAndClickSlot(page, resourceId, startHH, endHH, timeoutMs = 6000) {
-  const deadline = Date.now() + timeoutMs;
+async function findAndClickSlot(page, resourceId, startHH, endHH, timeoutMs = 7000) {
+  // Some grids use unpadded hour like "0:30". Build selector variants.
+  const toVariants = (hhmm) => {
+    if (!hhmm) return [];
+    const [H, M] = hhmm.split(':');
+    const hNum = String(parseInt(H, 10));
+    const v1 = `${H.padStart(2,'0')}:${M}`;
+    const v2 = `${hNum}:${M}`;
+    return Array.from(new Set([v1, v2]));
+  };
 
-  // Try to locate the row containing this resourceId (this keeps scroll focused)
+  const startVars = toVariants(startHH);
+  const endVars   = endHH ? toVariants(endHH) : [];
+
+  const selectors = [];
+  // exact start+end first (both padded and unpadded)
+  if (endVars.length) {
+    for (const s of startVars) for (const e of endVars) {
+      selectors.push(`div[data-court-id="${resourceId}"][data-start-hour="${s}"][data-end-hour="${e}"]`);
+    }
+  }
+  // then start-only fallback
+  for (const s of startVars) {
+    selectors.push(`div[data-court-id="${resourceId}"][data-start-hour="${s}"]`);
+  }
+
+  // Try to keep the row in view for virtualization-heavy pages
   const row = page.locator(`div.flex.border-b.ui-stroke-neutral-default:has(div[data-court-id="${resourceId}"])`).first();
-  try { await row.waitFor({ timeout: 3000 }); } catch {}
-
+  try { await row.waitFor({ timeout: 2500 }); } catch {}
   if (await row.count()) {
     try { await row.scrollIntoViewIfNeeded(); } catch {}
   }
 
-  // Primary selector: exact start & end
-  const exact = page.locator(
-    `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"][data-end-hour="${endHH}"]`
-  ).first();
-
-  // Fallback: match by start only (if endHH variants exist)
-  const startOnly = page.locator(
-    `div[data-court-id="${resourceId}"][data-start-hour="${startHH}"]`
-  ).first();
-
-  // choose which locator to try first
-  let target = exact;
-  if (!(await exact.count()) && (await startOnly.count())) target = startOnly;
-
-  // If neither exists yet (virtualized list?), sweep+retry a few times
-  for (let i = 0; i < 8; i++) {
-    if (await target.count()) break;
-    // nudge the scrollable container down a bit
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const target = page.locator(sel).first();
+      if (await target.count()) {
+        try { await target.scrollIntoViewIfNeeded(); } catch {}
+        const hit = target.locator('div.absolute').first();
+        try {
+          if (await hit.count()) await hit.click({ force: true });
+          else await target.click({ force: true });
+        } catch {
+          // one retry after a tiny delay
+          await page.waitForTimeout(120);
+          try { await target.click({ force: true }); } catch {}
+        }
+        // small settle + optimistic wait for any popup content
+        await page.waitForTimeout(180);
+        return { clicked: true };
+      }
+    }
+    // nudge scroll a bit and retry
     await page.evaluate(() => {
       const first = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
       const getScrollableParent = (el) => {
@@ -961,32 +1038,14 @@ async function findAndClickSlot(page, resourceId, startHH, endHH, timeoutMs = 60
         return null;
       };
       const sc = first && getScrollableParent(first);
-      if (sc) sc.scrollTop = Math.min(sc.scrollTop + Math.floor(sc.clientHeight * 0.8), sc.scrollHeight);
+      if (sc) sc.scrollTop = Math.min(sc.scrollTop + Math.floor(sc.clientHeight * 0.85), sc.scrollHeight);
     }).catch(()=>{});
-    await page.waitForTimeout(120);
+    await page.waitForTimeout(140);
   }
 
-  if (!(await target.count())) {
-    return { clicked: false, reason: 'slot_not_found' };
-  }
-
-  try { await target.scrollIntoViewIfNeeded(); } catch {}
-  // Prefer clicking the absolute child (hit target), fallback to the block itself
-  const hit = target.locator('div.absolute').first();
-  if (await hit.count()) {
-    await hit.click({ force: true });
-  } else {
-    await target.click({ force: true });
-  }
-
-  await page.waitForTimeout(150); // small settle
-  // best-effort wait until a popup header appears (but don’t block forever)
-  try {
-    await page.locator('div.flex.flex-row.justify-between.font-bold').first().waitFor({ timeout: 1500 });
-  } catch {}
-
-  return { clicked: true };
+  return { clicked: false, reason: 'slot_not_found' };
 }
+
 
 
 
@@ -1470,6 +1529,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
