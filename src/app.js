@@ -535,7 +535,6 @@ perClubItems.push({
 
 
 
-
 /* =========================
    Single-slot price verifier — simple & strict
    ========================= */
@@ -660,6 +659,37 @@ app.get('/price', async (req, res) => {
     return null;
   }
 
+  // NEW: read the **header** (court name on the left, start time on the right) from the popup
+  async function readPopupHeader(tip) {
+    const toHMM = (s) => {
+      const m = /(\d{1,2}):(\d{2})/.exec(String(s||''));
+      return m ? `${parseInt(m[1],10)}:${m[2]}` : null; // strip leading zero in hours
+    };
+    const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+
+    // try the exact header you described
+    let header = tip.locator('.flex.flex-row.justify-between.font-bold').first();
+    if (await header.count()) {
+      const kids = header.locator(':scope > div');
+      const name = norm(await kids.nth(0).innerText().catch(()=>'')) || null;
+      const time = toHMM(await kids.nth(1).innerText().catch(()=>'')) || null;
+      return { name, time };
+    }
+
+    // fallback: any two-div row where the right side looks like a time
+    const all = await tip.locator('div').all().catch(()=>[]);
+    for (const r of all) {
+      const kids = r.locator(':scope > div');
+      if ((await kids.count().catch(()=>0)) < 2) continue;
+      const right = await kids.nth(1).innerText().catch(()=> '');
+      const time  = toHMM(right);
+      if (!time) continue;
+      const name  = norm(await kids.nth(0).innerText().catch(()=>'')) || null;
+      return { name, time };
+    }
+    return null;
+  }
+
   async function readRowsFromTooltip(tip) {
     // First try the explicit row pattern you pasted.
     let rows = await tip.locator('div.flex.cursor-pointer.flex-row.justify-between').all().catch(()=>[]);
@@ -712,8 +742,11 @@ app.get('/price', async (req, res) => {
     steps: [],
     clicked: false,
     tooltip: null,
+    popupHeaderName: null,   // NEW
+    popupHeaderTime: null,   // NEW
     rows: [],
-    chosen: null
+    chosen: null,
+    continueBtnPrice: null   // NEW
   };
 
   let context, page;
@@ -766,14 +799,32 @@ app.get('/price', async (req, res) => {
     }
     debug.tooltip = 'found';
 
+    // NEW: read header (court name + start time) from the popup and log it
+    const header = await readPopupHeader(tip);
+    debug.popupHeaderName = header?.name || null;
+    debug.popupHeaderTime = header?.time || null;
+    console.log('[PRICE_POPUP_HEADER]', {
+      slug, resourceId, paramStart: startHH,
+      headerName: debug.popupHeaderName,
+      headerTime: debug.popupHeaderTime
+    });
+
     // 3) read rows and pick the requested duration
     const rows = await readRowsFromTooltip(tip);
     debug.rows = rows;
+    console.log('[PRICE_ROWS]', rows);
+
     const chosen = rows.find(r => r.minutes === duration) || null;
     debug.chosen = chosen;
+    console.log('[PRICE_CHOSEN]', chosen);
 
     let price = chosen?.price || null;
-    if (!price) price = await readContinuePrice(page, 1200); // last resort
+    if (!price) {
+      const cont = await readContinuePrice(page, 1200); // last resort
+      debug.continueBtnPrice = cont || null;
+      console.log('[PRICE_CONTINUE_BTN]', cont);
+      if (cont) price = cont;
+    }
 
     return res.json({
       slug, date, resourceId,
@@ -1183,3 +1234,4 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
