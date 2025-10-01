@@ -613,7 +613,16 @@ app.get('/price', async (req, res) => {
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
     debug.clicked = !!clickRes?.clicked;
     debug.courtName = clickRes?.courtName || debug.courtName || null;
-    await page.waitForTimeout(180);
+    await page.waitForTimeout(500);
+
+     try {
+  const loc = await findSlotLocator(page, resourceId, startHH, endHH);
+  const bb = loc ? await loc.boundingBox().catch(() => null) : null;
+  if (bb) {
+    await page.mouse.move(bb.x + bb.width/2, bb.y + Math.min(bb.height/2, 8));
+    await page.waitForTimeout(200); // park cursor briefly
+  }
+} catch {}
 
     if (!debug.clicked) {
       // fallback 1: availability JSON
@@ -714,6 +723,7 @@ app.get('/price', async (req, res) => {
 
 // Robust popup finder that works for tooltip OR modal variants
 async function findBookingPopup(page, { courtName, startHH }, timeoutMs = 4500) {
+   console.log('POPUP_FINDER_ACTIVE', { version: 'A2', at: Date.now() });
   const deadline = Date.now() + timeoutMs;
 
   const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
@@ -746,8 +756,8 @@ async function findBookingPopup(page, { courtName, startHH }, timeoutMs = 4500) 
 
       // Must be visible and reasonably sized
       try {
-        const bb = await p.boundingBox().catch(() => null);
-        if (!bb || bb.width < 160 || bb.height < 80) continue;
+        //const bb = await p.boundingBox().catch(() => null); debiil
+        //if (!bb || bb.width < 160 || bb.height < 80) continue;
       } catch { continue; }
 
       // If we can find a header row, confirm time/name there
@@ -895,6 +905,7 @@ async function getCourtNameForResource(page, rid) {
 // Find the *right* tooltip by matching header: left=name, right=time (tolerant)
 // We do NOT require a "Continue" button. Returns a Locator or null.
 async function findTooltipByHeader(page, expectName, expectStart, timeoutMs = 4500) {
+   console.log('POPUP_FINDER_ACTIVE', { version: 'A1', at: Date.now() });
   const deadline = Date.now() + timeoutMs;
 
   const norm = s => String(s||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
@@ -943,6 +954,34 @@ async function findTooltipByHeader(page, expectName, expectStart, timeoutMs = 45
     await page.waitForTimeout(120);
   }
   return null;
+}
+
+//debiil
+
+const tip = await findTooltipByHeader(page, debug.courtName, startHH, Math.max(800, deadline - Date.now()));
+if (!tip) {
+  const dump = await page.evaluate(() => {
+    const sels = ['[role="dialog"]','[aria-modal="true"]','[role="tooltip"]','div.fixed','div.absolute','[data-state="open"]'];
+    const seen = new Set();
+    const out = [];
+    const norm = s => String(s||'').replace(/\s+/g,' ').trim();
+    for (const sel of sels) {
+      document.querySelectorAll(sel).forEach(el => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        const r = el.getBoundingClientRect();
+        const header = el.querySelector('.flex.flex-row.justify-between.font-bold');
+        out.push({
+          sel,
+          w: Math.round(r.width), h: Math.round(r.height),
+          header: header ? norm(header.textContent).slice(0,180) : null,
+          text: norm(el.innerText || '').slice(0,220)
+        });
+      });
+    }
+    return out;
+  });
+  console.log('POPUP_CANDIDATES', dump);
 }
 
 // Extract rows like ["1h 30m","54 EUR"] from a tooltip container Locator
@@ -1287,4 +1326,5 @@ async function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
 
