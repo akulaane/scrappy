@@ -561,7 +561,7 @@ app.get('/price', async (req, res) => {
   let   duration   = parseInt(req.query.duration || '0', 10) || 0;
 
   // local helpers
-  const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
+  const hmToMin   = (s) => { const [h, m] = String(s).split(':').map(Number); return (h|0)*60 + (m|0); };
   const minToHHMM = (min) => { const v=((min%1440)+1440)%1440, H=Math.floor(v/60), M=v%60; return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}`; };
 
   if (!slug || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !resourceId || !startHH) {
@@ -582,6 +582,7 @@ app.get('/price', async (req, res) => {
     url: `${BASE}/clubs/${encodeURIComponent(slug)}`,
     steps: [],
     clicked: null,
+    durationPicked: null,
     domPrice: null,
     jsonPrice: null,
     source: null
@@ -591,7 +592,7 @@ app.get('/price', async (req, res) => {
     context = await newContext();
     page = await context.newPage();
 
-    // trim trackers for speed
+    // Trim trackers for speed
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.includes('google-analytics.com') || u.includes('googletagmanager.com') ||
@@ -602,7 +603,7 @@ app.get('/price', async (req, res) => {
       route.continue();
     });
 
-    // nav + hydrate
+    // Navigate + hydrate
     await page.goto(debug.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector('#__next', { timeout: 30000 }).catch(() => {});
     await autoDismissConsent(page).catch(() => {});
@@ -610,38 +611,37 @@ app.get('/price', async (req, res) => {
     const hydrated = await ensureHydrated(page);
     debug.steps.push(hydrated ? 'hydrated' : 'not_hydrated');
 
-    // pick date in UI so the correct grid is shown
+    // Pick the date in the UI (so the correct grid renders)
     await forceDateInUI(page, date);
     debug.steps.push('date_selected');
 
-    // click the slot
+    // Click the exact slot (auto-scroll & tolerate 0:30/00:30)
     const clickRes = await findAndClickSlot(page, resourceId, startHH, endHH);
-    debug.clicked = clickRes.clicked;
+    debug.clicked = !!clickRes?.clicked;
 
-if (debug.clicked) {
-  // 1) pick the requested duration, if provided
-  if (duration) {
-    const picked = await selectDurationOption(page, duration, 3500);
-    debug.durationPicked = picked;
-  }
+    // If clicked, select requested duration (if provided) and read DOM price
+    if (debug.clicked) {
+      if (duration) {
+        // (helper should click the "1h 00m" / "1h 30m" / "2h 00m" option and wait for the button to update)
+        debug.durationPicked = await selectDurationOption(page, duration, 4000);
+      }
+      // Read "Continue — XX EUR" (your helper may accept (page, timeoutMs) or (page, settleMs, timeoutMs);
+      // keeping the single-arg call for compatibility with your current helper)
+      debug.domPrice = await readContinuePrice(page, 6000);
+      if (debug.domPrice) {
+        debug.source = 'dom';
+        return res.json({
+          slug, date, resourceId,
+          startTime: startHH,
+          endTime: endHH || minToHHMM(hmToMin(startHH) + duration),
+          price: debug.domPrice,
+          source: 'dom',
+          debug
+        });
+      }
+    }
 
-  // 2) read the price from the "Continue – XX EUR" button (or fallback in modal)
-  debug.domPrice = await readContinuePrice(page, 4500);
-  if (debug.domPrice) {
-    debug.source = 'dom';
-    return res.json({
-      slug, date, resourceId,
-      startTime: startHH,
-      endTime: endHH || minToHHMM(hmToMin(startHH) + duration),
-      price: debug.domPrice,
-      source: 'dom',
-      debug
-    });
-  }
-}
-
-
-    // DOM failed or slot not clickable — fall back to availability JSON (single fetch)
+    // DOM failed or not clickable — fall back to availability JSON (single fetch inside page)
     debug.jsonPrice = await priceFromAvailabilityJSON(page, date, resourceId, startHH, endHH, duration);
     debug.source = debug.jsonPrice ? 'json' : 'unknown';
 
@@ -662,6 +662,7 @@ if (debug.clicked) {
 });
 
 
+
 /* =========================
    Helpers
    ========================= */
@@ -672,6 +673,136 @@ if (debug.clicked) {
 // If endHH provided, prefer exact start+end; otherwise click any block with that start.
 // Click the specific slot for (resourceId, startHH, endHH?)
 // If endHH provided, prefer exact match; otherwise click any with that start.
+
+// Accept both "0:30" and "00:30" etc.
+function hhVariants(hhmm) {
+  const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return [String(hhmm || '')];
+  const H = parseInt(m[1], 10);
+  const M = m[2];
+  const v1 = `${H}:${M}`;
+  const v2 = `${String(H).padStart(2,'0')}:${M}`;
+  return [...new Set([v1, v2])];
+}
+
+// Find the scrollable container for the grid
+async function getGridScroller(page) {
+  const handle = await page.evaluateHandle(() => {
+    const sample = document.querySelector('div[data-court-id][data-start-hour][data-end-hour]');
+    const getScrollableParent = (el) => {
+      let p = el?.parentElement;
+      while (p) {
+        const cs = getComputedStyle(p);
+        if (/(auto|scroll)/.test(cs.overflowY)) return p;
+        p = p.parentElement;
+      }
+      return null;
+    };
+    return sample ? getScrollableParent(sample) : (document.scrollingElement || document.body);
+  });
+  return handle;
+}
+
+// Find the clickable element for a slot (inner absolute block if present)
+async function findSlotLocator(page, resourceId, startHH, endHH) {
+  const starts = hhVariants(startHH);
+  const ends   = endHH ? hhVariants(endHH) : [null];
+
+  for (const s of starts) {
+    for (const e of ends) {
+      let base = page.locator(`div[data-court-id="${resourceId}"][data-start-hour="${s}"]`);
+      if (e) base = base.filter({ has: page.locator(`[data-end-hour="${e}"]`) });
+      if (await base.count()) {
+        // Prefer the inner absolute block if it exists (that’s what’s clickable)
+        const abs = base.locator('xpath=.//div[contains(@class,"absolute")]').first();
+        if (await abs.count()) return abs;
+        return base.first();
+      }
+    }
+  }
+  return null;
+}
+
+// Scroll the slot into view and click it; confirm modal appears
+async function clickSlotAndWaitModal(page, resourceId, startHH, endHH, timeoutMs = 5000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const loc = await findSlotLocator(page, resourceId, startHH, endHH);
+    if (loc) {
+      try { await loc.scrollIntoViewIfNeeded(); } catch {}
+      await page.waitForTimeout(80);
+      const box = await loc.boundingBox().catch(() => null);
+      if (box) {
+        await page.mouse.click(box.x + box.width / 2, box.y + Math.min(box.height / 2, 8), { delay: 20 });
+      } else {
+        await loc.click({ force: true }).catch(()=>{});
+      }
+
+      // modal visible?
+      const modal = page.getByRole('dialog').first();
+      if (await modal.count()) return true;
+      const cont = page.getByRole('button', { name: /continue/i }).first();
+      if (await cont.count()) return true;
+    }
+
+    // Nudge virtualization by scrolling a bit
+    const sc = await getGridScroller(page);
+    await page.evaluate(sc => { sc.scrollTop += Math.floor(sc.clientHeight * 0.8); }, sc).catch(()=>{});
+    try { await sc.dispose(); } catch {}
+    await page.waitForTimeout(120);
+  }
+  return false;
+}
+
+// Duration → label the UI shows (60 -> "1h 00m", 90 -> "1h 30m")
+function formatDurationLabel(mins) {
+  const h = Math.floor((mins|0) / 60);
+  const m = (mins|0) % 60;
+  return `${h}h ${String(m).padStart(2,'0')}m`;
+}
+
+// Click a duration option in the modal
+async function selectDurationOption(page, minutes, timeoutMs = 4000) {
+  if (!minutes) return false;
+  const label = formatDurationLabel(minutes);
+  const end = Date.now() + timeoutMs;
+
+  while (Date.now() < end) {
+    const opt = page.getByRole('button', { name: new RegExp(`^\\s*${label}\\s*$`, 'i') }).first();
+    if (await opt.count()) {
+      try { await opt.scrollIntoViewIfNeeded(); } catch {}
+      await opt.click({ force: true, delay: 20 }).catch(()=>{});
+      await page.waitForTimeout(120);
+      return true;
+    }
+    await page.waitForTimeout(120);
+  }
+  return false;
+}
+
+// Read the price from the "Continue – XX EUR" button and let it settle
+async function readContinuePrice(page, settleMs = 350, timeoutMs = 5000) {
+  const moneyRe = /\b\d+(?:[.,]\d{1,2})?\s*(?:€|EUR)\b/i;
+  let last = null, lastChange = Date.now();
+  const end = Date.now() + timeoutMs;
+
+  while (Date.now() < end) {
+    const btn = page.getByRole('button', { name: /continue/i }).first();
+    if (await btn.count()) {
+      const txt = (await btn.textContent()) || '';
+      const m = txt.match(moneyRe);
+      if (m) {
+        const val = m[0].replace(/\s+/g,' ').trim();
+        if (val !== last) { last = val; lastChange = Date.now(); }
+        if (Date.now() - lastChange >= settleMs) return last; // stable enough
+      }
+    }
+    await page.waitForTimeout(120);
+  }
+  return last;
+}
+
+
 
 // Turn minutes into the label Playtomic shows, e.g. 60 -> "1h 00m", 90 -> "1h 30m"
 function formatDurationLabel(mins) {
@@ -1264,6 +1395,7 @@ app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
    
 });
+
 
 
 
